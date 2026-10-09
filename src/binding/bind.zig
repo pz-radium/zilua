@@ -77,9 +77,11 @@ pub fn CallThen(comptime next: anytype, comptime ArgsT: type) type {
 /// `next` (a Zig function, bound like any other) with the call's results;
 /// what `next` returns is what the bound function returns.
 ///
-/// On Lua 5.2 to 5.5 the call can yield: `func` may suspend the coroutine,
-/// and `next` runs once it is resumed and `func` returns. Elsewhere yielding
-/// inside `func` is an "attempt to yield across a C-call boundary" error.
+/// On Lua 5.2 to 5.5 and Luau the call can yield: `func` may suspend the
+/// coroutine, and `next` runs once it is resumed and `func` returns. On Lua
+/// 5.1 and LuaJIT yielding inside `func` is an "attempt to yield across a
+/// C-call boundary" error. (On Luau this needs the function pushed by zilua,
+/// as `setGlobal` and the usertype methods do, not a bare `zilua.wrap`.)
 pub fn callThen(func: ref.Function, args: anytype, comptime next: anytype) CallThen(next, @TypeOf(args)) {
     return .{ .func = func, .args = args };
 }
@@ -140,6 +142,23 @@ pub fn wrap(comptime f: anytype) api.CFunction {
     if (F == RawCFunction) return &f;
     comptime check(F);
     return &Trampoline(f).call;
+}
+
+/// Pushes `f` as a Lua function (`wrap`); `name` shows in Luau's error
+/// messages. Functions that return `CallThen` get a continuation on Luau,
+/// which makes their call yieldable there.
+pub fn push(L: *lua_State, comptime f: anytype, name: ?[*:0]const u8) void {
+    api.pushCClosureCont(L, wrap(f), 0, name, comptime luauContinuationOf(@TypeOf(f)));
+}
+
+fn luauContinuationOf(comptime F: type) ?api.LuauContinuation {
+    const R = @typeInfo(F).@"fn".return_type.?;
+    const Value = switch (@typeInfo(R)) {
+        .error_union => |e| e.payload,
+        else => R,
+    };
+    if (!isCallThen(Value)) return null;
+    return api.luauContinuation(Continuation(Value.continuation).resume_);
 }
 
 fn check(comptime F: type) void {
@@ -300,6 +319,7 @@ fn fail(L: *lua_State, err: anyerror, diag: Diagnostic) noreturn {
             error.InvalidEnum => "invalid enum value",
             error.MissingField => api.pushFString(L, "%s expected, got table with missing fields", diag.expected.ptr),
             error.ReadOnly => api.pushFString(L, "mutable %s expected, got read-only reference", diag.expected.ptr),
+            error.Dead => api.pushFString(L, "%s no longer exists", diag.expected.ptr),
             else => api.pushFString(L, "%s expected, got %s", diag.expected.ptr, api.typeName(L, diag.arg)),
         };
         _ = api.raiseArgError(L, diag.arg, msg);

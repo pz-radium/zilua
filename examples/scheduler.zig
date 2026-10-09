@@ -35,8 +35,6 @@ fn onError(state: zilua.State, message: []const u8) void {
 pub fn main(init: std.process.Init) !void {
     const lua = try zilua.State.init(init.gpa, .{});
     defer lua.deinit();
-    // Stop runaway scripts: about a million instructions per resume.
-    lua.setInstructionLimit(1_000_000);
 
     var scheduler: zilua.Scheduler = .init(lua, init.gpa);
     defer scheduler.deinit();
@@ -45,7 +43,9 @@ pub fn main(init: std.process.Init) !void {
     scheduler.registerWait("wait");
     scheduler.registerSpawn("spawn");
 
-    const sandbox = try lua.newSandbox(.{});
+    // Stop runaway scripts: about a million instructions and a megabyte each
+    // time a task runs.
+    const sandbox = try lua.newSandbox(.{ .limits = .{ .memory = 1 << 20, .instructions = 1_000_000 } });
     defer sandbox.deinit();
     try sandbox.set("log", log);
     inline for (.{ "wait", "spawn" }) |name| {
@@ -61,7 +61,8 @@ pub fn main(init: std.process.Init) !void {
 
     const level = try sandbox.get(zilua.Function, "level");
     defer level.deinit();
-    try scheduler.spawn(level, .{});
+    // The sandbox's limits apply to the task, and to `door`, which it spawns.
+    try scheduler.spawnLimited(level, .{}, sandbox.limits);
 
     // A fixed-step game loop.
     var time: f64 = 0;

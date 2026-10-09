@@ -113,6 +113,7 @@ pub const Thread = struct {
         const co = self.state.L;
         self.state.enterCall();
         defer self.state.leaveCall();
+        self.state.hookThread(co);
         const result = api.resumeThread(co, self.state.ctx.main, nargs);
         return switch (result.status) {
             .ok, .yield => result,

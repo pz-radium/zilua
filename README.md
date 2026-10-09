@@ -161,7 +161,8 @@ fn shout(gpa: std.mem.Allocator, text: []const u8) !zilua.Owned([]u8) {
 ```
 
 To call back into Lua and continue in Zig with the results, return
-`zilua.CallThen`. On Lua 5.2 to 5.5 the Lua function may yield in between:
+`zilua.CallThen`. On Lua 5.2 to 5.5 and Luau the Lua function may yield in
+between:
 
 ```zig
 fn apply(f: zilua.Function, x: i64) zilua.CallThen(addOne, struct { i64 }) {
@@ -221,7 +222,11 @@ read from a table only with the `*Alloc` functions, which copy them.
   `pub fn __gc(self: *T) void` if the type declares it, otherwise
   `pub fn deinit(self: *T) void`. A type whose `deinit` needs more arguments
   cannot be pushed by value: push a pointer, or declare `__gc`.
-- A value pushed by pointer stays Zig's and must outlive its use from Lua.
+- A value pushed by pointer stays Zig's and must outlive its use from Lua,
+  or be detached first with `lua.invalidate(ptr)`: scripts that still hold
+  it (or a field inside it) then get "T no longer exists" instead of
+  touching freed memory. Lua has one userdata per object, so pushing the
+  same pointer twice gives the same value.
 - A struct field that is itself a struct is returned as a reference into the
   parent, and keeps the parent alive.
 - Strings and pointers read from Lua point into Lua memory. Arguments of
@@ -275,6 +280,10 @@ scheduler.registerSpawn("spawn"); // spawn(function) in Lua
 try scheduler.spawn(level_script, .{});
 while (running) scheduler.update(seconds_since_start);
 ```
+
+Tasks can run under limits like a sandbox call, applied every time they
+run: `scheduler.spawnLimited(func, args, sandbox.limits)`. A task spawned by
+code that runs under limits (a sandbox call, a limited task) inherits them.
 
 ### Async work with std.Io
 
@@ -387,10 +396,10 @@ Bound functions taking a `zilua.State` work in modules too.
 ## Limitations
 
 - LuaJIT is not available on 32-bit ARM.
-- `CallThen` cannot yield on Lua 5.1, LuaJIT and Luau.
+- `CallThen` cannot yield on Lua 5.1 and LuaJIT, whose C APIs have no
+  continuations.
 - Lua C modules on Windows need an import library for the host's Lua DLL,
   which zilua does not set up.
-- Coroutines run by a `Scheduler` use the state's limits, not a sandbox's.
 
 ## Development
 

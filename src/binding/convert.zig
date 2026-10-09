@@ -24,6 +24,9 @@ pub const Error = error{
     MissingField,
     /// A read-only usertype reference where a mutable `*T` was required.
     ReadOnly,
+    /// A usertype value that no longer exists: a reference whose Zig object
+    /// was detached (`State.invalidate`), or a finalized value.
+    Dead,
 };
 
 /// Errors of the conversions that allocate (`toAlloc`).
@@ -256,7 +259,7 @@ pub fn push(L: *lua_State, value: anytype) void {
             if (u.tag_type == null) @compileError("zilua: cannot push untagged union " ++ @typeName(T));
             pushUnion(L, value);
         },
-        .@"fn" => api.pushCFunction(L, bind.wrap(value)),
+        .@"fn" => bind.push(L, value, null),
         .error_union => @compileError("zilua: handle the error before pushing " ++ @typeName(T)),
         else => @compileError("zilua: cannot push values of type " ++ @typeName(T)),
     }
@@ -393,7 +396,8 @@ pub fn to(comptime T: type, L: *lua_State, idx: c_int) Error!T {
         .pointer => |p| {
             if (p.size != .one) @compileError("zilua: cannot read " ++ @typeName(T) ++ " from Lua");
             if (comptime isUsertype(p.child)) {
-                const header = usertype.check(L, p.child, idx) orelse return error.TypeMismatch;
+                const header = usertype.check(L, p.child, idx) orelse
+                    return if (usertype.isDead(L, p.child, idx)) error.Dead else error.TypeMismatch;
                 if (!p.attrs.@"const" and header.read_only) return error.ReadOnly;
                 return @ptrCast(@alignCast(header.ptr));
             }
@@ -529,6 +533,7 @@ fn toStruct(comptime T: type, L: *lua_State, idx: c_int) Error!T {
         const ptr: *const T = @ptrCast(@alignCast(header.ptr));
         return ptr.*;
     }
+    if (usertype.isDead(L, T, idx)) return error.Dead;
     if (api.typeOf(L, idx) != .table) return error.TypeMismatch;
 
     const info = @typeInfo(T).@"struct";
@@ -699,6 +704,7 @@ pub fn toAlloc(comptime T: type, gpa: std.mem.Allocator, L: *lua_State, idx: c_i
             const ptr: *const T = @ptrCast(@alignCast(header.ptr));
             return dupe(gpa, ptr.*);
         }
+        if (usertype.isDead(L, T, idx)) return error.Dead;
         if (api.typeOf(L, idx) != .table) return error.TypeMismatch;
         if (comptime !allCanReadAlloc(@typeInfo(T).@"struct".field_types)) return error.TypeMismatch;
         return tableToStruct(T, gpa, L, idx);

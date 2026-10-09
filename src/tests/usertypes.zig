@@ -122,6 +122,46 @@ test "deinit runs when Lua collects an owned value" {
     try testing.expectError(error.Runtime, lua.doString("r2:deinit()"));
 }
 
+test "invalidate detaches Lua from a Zig object" {
+    const Inner = struct { v: i64 };
+    const Outer = struct {
+        inner: Inner,
+        hp: i64,
+
+        pub const zilua_name = "Outer";
+
+        pub fn get(self: *const @This()) i64 {
+            return self.hp;
+        }
+    };
+    const lua = try open();
+    defer lua.deinit();
+
+    var outer: Outer = .{ .inner = .{ .v = 1 }, .hp = 10 };
+    lua.setGlobal("o", &outer);
+    lua.setGlobal("same", &outer);
+    try run(lua,
+        \\inner = o.inner
+        \\assert(inner.v == 1 and o:get() == 10)
+        \\assert(rawequal(o, same)) -- one userdata per object
+    );
+
+    lua.invalidate(&outer);
+    try testing.expectError(error.Runtime, lua.doString("return o.hp"));
+    try expectContains(lua.errorMessage(), "Outer no longer exists");
+    try testing.expectError(error.Runtime, lua.doString("return o:get()"));
+    try expectContains(lua.errorMessage(), "Outer no longer exists");
+    try testing.expectError(error.Runtime, lua.doString("o.hp = 1"));
+    // References into the object die with it.
+    try testing.expectError(error.Runtime, lua.doString("return inner.v"));
+    try expectContains(lua.errorMessage(), "no longer exists");
+    try run(lua, "assert(tostring(o) == 'Outer (no longer exists)')");
+
+    // Pushing the object again gives Lua a new, live reference.
+    lua.setGlobal("o", &outer);
+    try run(lua, "assert(o:get() == 10 and not rawequal(o, same))");
+}
+
 test "metatables are locked and finalized values are unusable" {
     const Resource = struct {
         var finalized: u32 = 0;

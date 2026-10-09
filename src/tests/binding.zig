@@ -142,10 +142,14 @@ test "callThen continues in Zig with the results of a Lua call" {
     try run(lua, "r = apply(function(v) return v * 2 end, 5)");
     try testing.expectEqual(11, try lua.getGlobal(i64, "r"));
 
-    // The Lua function may yield on 5.2+, which supports continuations.
+    // The Lua function may yield on 5.2+ and Luau, which have continuations,
+    // whether the bound function is a global or a method.
+    lua.setGlobal("scaler", Scaler{ .factor = 3 });
     try run(lua,
         \\function task()
-        \\  return apply(function(v) return coroutine.yield(v) end, 5)
+        \\  local a = apply(function(v) return coroutine.yield(v) end, 5)
+        \\  local b = scaler:apply(function(v) return coroutine.yield(v) end, 2)
+        \\  return a + b
         \\end
     );
     const task = try lua.getGlobal(zilua.Function, "task");
@@ -153,13 +157,23 @@ test "callThen continues in Zig with the results of a Lua call" {
     const co = lua.newThread(task);
     defer co.deinit();
     switch (zilua.lang) {
-        .lua52, .lua53, .lua54, .lua55 => {
+        .lua52, .lua53, .lua54, .lua55, .luau => {
             try testing.expectEqual(5, (try co.run(i64, .{})).yielded);
-            try testing.expectEqual(21, (try co.run(i64, .{20})).returned);
+            try testing.expectEqual(6, (try co.run(i64, .{20})).yielded);
+            // (20 + 1) + (100 + 1)
+            try testing.expectEqual(122, (try co.run(i64, .{100})).returned);
         },
-        .lua51, .luajit, .luau => {
+        .lua51, .luajit => {
             try testing.expectError(error.Runtime, co.run(i64, .{}));
             try expectContains(lua.errorMessage(), "yield");
         },
     }
 }
+
+const Scaler = struct {
+    factor: i64,
+
+    pub fn apply(self: *const Scaler, f: zilua.Function, x: i64) zilua.CallThen(funcs.addOne, struct { i64 }) {
+        return .{ .func = f, .args = .{x * self.factor} };
+    }
+};

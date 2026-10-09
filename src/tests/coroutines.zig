@@ -195,6 +195,55 @@ test "Scheduler: jobs need Scheduler.io, not the state's std.Io" {
     try testing.expectEqual(1, Errors.seen);
 }
 
+test "Scheduler: tasks run under the limits they are given or inherit" {
+    const Errors = struct {
+        var instructions: u32 = 0;
+        var memory: u32 = 0;
+
+        fn onError(state: zilua.State, message: []const u8) void {
+            _ = state;
+            if (helpers.contains(message, "instruction limit exceeded")) instructions += 1;
+            if (helpers.contains(message, "not enough memory")) memory += 1;
+        }
+    };
+    const lua = try open();
+    defer lua.deinit();
+    var scheduler: zilua.Scheduler = .init(lua, testing.allocator);
+    defer scheduler.deinit();
+    scheduler.on_error = Errors.onError;
+    scheduler.registerWait("wait");
+    scheduler.registerSpawn("spawn");
+
+    const sandbox = try lua.newSandbox(.{ .limits = .{ .memory = 1 << 20, .instructions = 100_000 } });
+    defer sandbox.deinit();
+    inline for (.{ "wait", "spawn" }) |name| {
+        const f = try lua.getGlobal(zilua.Function, name);
+        defer f.deinit();
+        try sandbox.set(name, f);
+    }
+    // Each would finish without limits; under them only `short` does.
+    try sandbox.doString(
+        \\function busy() wait() for i = 1, 10000000 do end end
+        \\function hog() wait() local t = {} for i = 1, 100000 do t[i] = string.rep("x", 1000) .. i end end
+        \\function short() wait() local n = 0 for i = 1, 1000 do n = n + i end done = n end
+        \\function spawner() spawn(busy) end
+    );
+    inline for (.{ "busy", "hog", "short" }) |name| {
+        const f = try sandbox.get(zilua.Function, name);
+        defer f.deinit();
+        try scheduler.spawnLimited(f, .{}, sandbox.limits);
+    }
+    // Spawned by sandbox code, which runs under the sandbox's limits.
+    try sandbox.call(void, "spawner", .{});
+    try testing.expectEqual(4, scheduler.count());
+
+    scheduler.update(0);
+    try testing.expectEqual(0, scheduler.count());
+    try testing.expectEqual(2, Errors.instructions);
+    try testing.expectEqual(1, Errors.memory);
+    try testing.expectEqual(500500, try sandbox.get(i64, "done"));
+}
+
 test "Scheduler: only one task can wait for a job" {
     const Errors = struct {
         var seen: u32 = 0;

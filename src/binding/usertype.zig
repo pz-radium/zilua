@@ -25,9 +25,10 @@ pub const Header = extern struct {
     owned: bool,
     /// Created from a `*const T`: Lua may read the value but not modify it.
     read_only: bool,
-    /// The finalizer has run. The userdata can still be reachable (a later
-    /// finalizer may resurrect it), but its value must not be used any more.
-    finalized: bool = false,
+    /// The value must not be used any more: its finalizer has run (a later
+    /// finalizer may still resurrect the userdata), or the Zig object of a
+    /// reference was detached with `invalidate`.
+    dead: bool = false,
 };
 
 /// Registry name of the metatable of `T` (as with `luaL_newmetatable`, for
@@ -177,44 +178,99 @@ pub fn pushOwned(L: *lua_State, comptime T: type, value: T) void {
     api.setMetatable(L, -2);
 }
 
+/// Slots of the metatable holding the reference caches (see `pushRef`).
+const cache_mutable = 1;
+const cache_read_only = 2;
+
 /// Pushes a userdata that refers to `ptr` (`*T` or `*const T`). Zig keeps
-/// ownership: the object must outlive every use from Lua.
+/// ownership: the object must outlive every use from Lua, or be detached
+/// with `invalidate` first. Lua gets one userdata per object, type and
+/// mutability, which is how `invalidate` finds it.
 pub fn pushRef(L: *lua_State, comptime T: type, ptr: anytype, read_only: bool) void {
     comptime validate(T);
-    const raw = api.newUserdata(L, @sizeOf(Header));
-    const header: *Header = @ptrCast(@alignCast(raw));
     const mutable: *T = @constCast(ptr);
-    header.* = .{ .ptr = mutable, .owned = false, .read_only = read_only };
     pushMetatable(L, T);
-    api.setMetatable(L, -2);
+    _ = api.rawGetI(L, -1, if (read_only) cache_read_only else cache_mutable);
+    if (api.rawGetP(L, -1, mutable) != .userdata) {
+        api.pop(L, 1);
+        const header: *Header = @ptrCast(@alignCast(api.newUserdata(L, @sizeOf(Header))));
+        header.* = .{ .ptr = mutable, .owned = false, .read_only = read_only };
+        api.pushValue(L, -3);
+        api.setMetatable(L, -2);
+        api.pushValue(L, -1);
+        api.rawSetP(L, -3, mutable);
+    }
+    // metatable, cache, userdata -> userdata
+    api.insert(L, -3);
+    api.pop(L, 2);
 }
 
-/// The header of the value at `idx` if it is a `T` userdata created by zilua.
+/// Detaches Lua from the Zig object at `ptr`: the references Lua holds to
+/// it, and to the struct fields inside it, die, and every later use of them
+/// raises an error. Call it before the object goes away.
+pub fn invalidate(L: *lua_State, comptime T: type, ptr: *const T) void {
+    if (api.rawGetP(L, api.registry_index, typeKey(T)) == .table) {
+        inline for (.{ cache_mutable, cache_read_only }) |slot| {
+            _ = api.rawGetI(L, -1, slot);
+            if (api.rawGetP(L, -1, ptr) == .userdata) {
+                const header: *Header = @ptrCast(@alignCast(api.toUserdata(L, -1).?));
+                header.dead = true;
+                api.pushNil(L);
+                api.rawSetP(L, -3, ptr);
+            }
+            api.pop(L, 2);
+        }
+    }
+    api.pop(L, 1);
+    // Usertype fields are handed out as references into the object.
+    const info = @typeInfo(T).@"struct";
+    if (info.layout == .@"packed") return;
+    inline for (info.field_names, info.field_types, info.field_attrs) |name, FT, attrs| {
+        if (comptime !attrs.@"comptime" and convert.isUsertype(FT) and isValid(FT)) {
+            invalidate(L, FT, &@field(ptr.*, name));
+        }
+    }
+}
+
+/// The header of the value at `idx` if it is a `T` userdata created by zilua
+/// that is still alive (see `Header.dead`).
 pub fn check(L: *lua_State, comptime T: type, idx: c_int) ?*Header {
+    const header = headerOf(L, T, idx) orelse return null;
+    return if (header.dead) null else header;
+}
+
+/// Whether the value at `idx` is a `T` userdata that `check` refuses only
+/// because it is dead.
+pub fn isDead(L: *lua_State, comptime T: type, idx: c_int) bool {
+    const header = headerOf(L, T, idx) orelse return false;
+    return header.dead;
+}
+
+/// The header of the value at `idx` if it is a `T` userdata created by
+/// zilua, dead or alive.
+fn headerOf(L: *lua_State, comptime T: type, idx: c_int) ?*Header {
     if (api.typeOf(L, idx) != .userdata) return null;
     if (!api.getMetatable(L, idx)) return null;
     _ = api.rawGetP(L, api.registry_index, typeKey(T));
     const same = api.rawEqual(L, -1, -2);
     api.pop(L, 2);
     if (!same) return null;
-    return live(L, idx);
+    return @ptrCast(@alignCast(api.toUserdata(L, idx).?));
 }
 
-/// The header of the zilua userdata at `idx`, or null once it is finalized.
-fn live(L: *lua_State, idx: c_int) ?*Header {
-    const header: *Header = @ptrCast(@alignCast(api.toUserdata(L, idx).?));
-    return if (header.finalized) null else header;
-}
-
-/// Like `check`, comparing with the metatable at `mt` (an upvalue of the
+/// Like `headerOf`, comparing with the metatable at `mt` (an upvalue of the
 /// metamethods) instead of looking it up in the registry.
-fn checkWith(L: *lua_State, idx: c_int, mt: c_int) ?*Header {
+fn headerWith(L: *lua_State, idx: c_int, mt: c_int) ?*Header {
     if (api.typeOf(L, idx) != .userdata) return null;
     if (!api.getMetatable(L, idx)) return null;
     const same = api.rawEqual(L, -1, mt);
     api.pop(L, 1);
     if (!same) return null;
-    return live(L, idx);
+    return @ptrCast(@alignCast(api.toUserdata(L, idx).?));
+}
+
+fn raiseDead(L: *lua_State, comptime T: type) c_int {
+    return api.raiseF(L, "%s no longer exists", displayName(T).ptr);
 }
 
 /// Makes the userdata at `child` keep the value at `parent` alive, for
@@ -244,6 +300,17 @@ pub fn pushMetatable(L: *lua_State, comptime T: type) void {
     const mt = api.getTop(L);
     api.pushValue(L, mt);
     api.rawSetP(L, api.registry_index, typeKey(T));
+
+    // Reference caches (see `pushRef`), with weak values so that they keep
+    // no reference alive.
+    inline for (.{ cache_mutable, cache_read_only }) |slot| {
+        api.newTable(L);
+        api.newTable(L);
+        api.pushString(L, "v");
+        api.setField(L, -2, "__mode");
+        api.setMetatable(L, -2);
+        api.rawSetI(L, mt, slot);
+    }
 
     api.pushString(L, displayName(T));
     api.setField(L, mt, "__name");
@@ -277,7 +344,7 @@ pub fn pushMetatable(L: *lua_State, comptime T: type) void {
 
     inline for (@typeInfo(T).@"struct".decl_names) |name| {
         if (comptime isBindable(T, name) and isMetamethodName(name) and !isHiddenDecl(T, name)) {
-            api.pushCFunctionNamed(L, bind.wrap(@field(T, name)), name.ptr);
+            bind.push(L, @field(T, name), name.ptr);
             api.setField(L, mt, name.ptr);
         }
     }
@@ -309,7 +376,7 @@ pub fn pushFunctionTable(L: *lua_State, comptime T: type) void {
     api.newTable(L);
     inline for (@typeInfo(T).@"struct".decl_names) |name| {
         if (comptime isBindable(T, name) and !isMetamethodName(name) and !isHiddenDecl(T, name)) {
-            api.pushCFunctionNamed(L, bind.wrap(@field(T, name)), name.ptr);
+            bind.push(L, @field(T, name), name.ptr);
             api.setField(L, -2, name.ptr);
         }
     }
@@ -335,7 +402,8 @@ fn indexFn(comptime T: type) api.CFunction {
 
             if (api.typeOf(L, 2) != .string) return 0;
             const key = api.toLString(L, 2).?;
-            const header = checkWith(L, 1, api.upvalueIndex(2)) orelse return 0;
+            const header = headerWith(L, 1, api.upvalueIndex(2)) orelse return 0;
+            if (header.dead) return raiseDead(L, T);
             const self: *T = @ptrCast(@alignCast(header.ptr));
             const info = @typeInfo(T).@"struct";
             // Fields of a packed struct have no addressable memory of their own.
@@ -368,7 +436,8 @@ fn newIndexFn(comptime T: type) api.CFunction {
         fn newIndex(L_: ?*lua_State) callconv(.c) c_int {
             const L = L_.?;
             const name_z = displayName(T).ptr;
-            const header = checkWith(L, 1, api.upvalueIndex(1)) orelse return api.raiseF(L, "%s expected", name_z);
+            const header = headerWith(L, 1, api.upvalueIndex(1)) orelse return api.raiseF(L, "%s expected", name_z);
+            if (header.dead) return raiseDead(L, T);
             if (header.read_only) return api.raiseF(L, "attempt to modify a read-only %s", name_z);
             if (api.typeOf(L, 2) != .string) return api.raiseF(L, "%s fields are indexed by name, got %s", name_z, api.typeName(L, 2));
             const key = api.toLString(L, 2).?;
@@ -424,7 +493,7 @@ fn finalize(comptime T: type, header: *Header, deferred: bool) void {
     // Finalize once, even if a later finalizer resurrects the object, and
     // make every later use of it fail (`check`).
     header.owned = false;
-    header.finalized = true;
+    header.dead = true;
     const self: *T = @ptrCast(@alignCast(header.ptr));
     switch (comptime finalizer(T)) {
         .gc_decl => T.__gc(self),
@@ -452,8 +521,12 @@ fn toStringFn(comptime T: type) api.CFunction {
     return &struct {
         fn toString(L_: ?*lua_State) callconv(.c) c_int {
             const L = L_.?;
-            const header = check(L, T, 1) orelse return api.raiseF(L, "%s expected", displayName(T).ptr);
-            _ = api.pushFString(L, "%s: %p", displayName(T).ptr, header.ptr);
+            const header = headerOf(L, T, 1) orelse return api.raiseF(L, "%s expected", displayName(T).ptr);
+            if (header.dead) {
+                _ = api.pushFString(L, "%s (no longer exists)", displayName(T).ptr);
+            } else {
+                _ = api.pushFString(L, "%s: %p", displayName(T).ptr, header.ptr);
+            }
             return 1;
         }
     }.toString;

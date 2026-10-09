@@ -62,6 +62,9 @@ pub const Context = struct {
     depth: u32 = 0,
     /// The limit was exceeded and the hook now fires on every instruction.
     limit_tripped: bool = false,
+    /// The budgets of the innermost call running under limits (a sandbox
+    /// call, a limited `Scheduler` task), which the tasks it spawns inherit.
+    active_limits: ?Sandbox.Limits = null,
     /// Given to bound functions that take a `std.Io` parameter.
     io: ?std.Io = null,
     /// References to release at the next call from Zig: Luau finalizers run
@@ -289,6 +292,12 @@ fn pcallTop(self: State, nargs: c_int, nresults: c_int) Error!void {
 /// and returns the matching error.
 fn captureError(self: State, status: api.Status) Error {
     const L = self.L;
+    // This runs outside protected mode, where an error would panic. The
+    // allocations it makes must not fail on a memory limit that the script
+    // has just run into; nothing is restored by defer, as a Lua error would
+    // skip it (only a real out-of-memory can raise here).
+    const limit = self.ctx.memory_limit;
+    self.ctx.memory_limit = null;
     switch (api.typeOf(L, -1)) {
         .string, .number => self.ctx.setErrorMessage(api.toLString(L, -1).?),
         else => {
@@ -300,6 +309,7 @@ fn captureError(self: State, status: api.Status) Error {
         },
     }
     api.pop(L, 1);
+    self.ctx.memory_limit = limit;
     return statusError(status);
 }
 
@@ -318,6 +328,9 @@ fn statusError(status: api.Status) Error {
 /// value is on top of `co`, and the message gets a traceback of `co`.
 pub fn captureThreadError(self: State, co: *api.lua_State, status: api.Status) Error {
     const main = self.ctx.main;
+    // Unprotected from here on: see `captureError`.
+    const limit = self.ctx.memory_limit;
+    self.ctx.memory_limit = null;
     const msg: [*:0]const u8 = switch (api.typeOf(co, -1)) {
         .string, .number => api.toCString(co, -1).?,
         else => api.pushFString(co, "(error object is a %s value)", api.typeName(co, -1)),
@@ -331,6 +344,7 @@ pub fn captureThreadError(self: State, co: *api.lua_State, status: api.Status) E
     api.pop(main, 1);
     // The coroutine is dead; drop what is left on its stack.
     api.setTop(co, 0);
+    self.ctx.memory_limit = limit;
     return statusError(status);
 }
 
@@ -380,7 +394,7 @@ pub fn fail(self: State, message: []const u8) error{LuaError} {
 pub fn setGlobal(self: State, name: [:0]const u8, value: anytype) void {
     if (@typeInfo(@TypeOf(value)) == .@"fn") {
         // Named, so that Luau's error messages can mention the function.
-        api.pushCFunctionNamed(self.L, bind.wrap(value), name.ptr);
+        bind.push(self.L, value, name.ptr);
     } else {
         convert.push(self.L, value);
     }
@@ -410,6 +424,24 @@ pub fn getGlobal(self: State, comptime T: type, name: [:0]const u8) Error!T {
 /// it is only needed to call `T`'s functions from Lua by name.
 pub fn registerType(self: State, comptime T: type) void {
     usertype.register(self.L, T, usertype.displayName(T).ptr);
+}
+
+/// Detaches Lua from a Zig object that was pushed by pointer: every
+/// reference Lua holds to `ptr.*`, or to struct fields inside it, stops
+/// working, and scripts that use one get "T no longer exists". Call it
+/// before freeing or moving an object whose pointer Lua may have kept:
+///
+///     const player = try gpa.create(Player);
+///     lua.setGlobal("player", player);
+///     ...
+///     lua.invalidate(player);
+///     gpa.destroy(player);
+pub fn invalidate(self: State, ptr: anytype) void {
+    const P = @typeInfo(@TypeOf(ptr));
+    if (comptime P != .pointer or P.pointer.size != .one or !convert.isUsertype(P.pointer.child)) {
+        @compileError("zilua: invalidate takes a pointer to a struct pushed to Lua, got " ++ @typeName(@TypeOf(ptr)));
+    }
+    usertype.invalidate(self.L, P.pointer.child, ptr);
 }
 
 pub fn globals(self: State) ref.Table {
@@ -532,7 +564,21 @@ pub const SavedLimits = struct {
     memory: ?usize,
     instructions: ?u64,
     set_instructions: bool,
+    active: ?Sandbox.Limits,
 };
+
+/// The budgets of the innermost call running under limits (see
+/// `applyLimits`), or null outside of one.
+pub fn activeLimits(self: State) ?Sandbox.Limits {
+    return self.ctx.active_limits;
+}
+
+/// Makes the instruction limit, if there is one, count in coroutine `co`.
+/// Coroutines only copy their creator's hook when created, so one made
+/// before the limit was set would otherwise run unchecked.
+pub fn hookThread(self: State, co: *api.lua_State) void {
+    if (self.ctx.instruction_limit != null) api.hookThread(co);
+}
 
 /// Tightens the limits for one call (see `Sandbox`): at most `memory_budget`
 /// more bytes and `instruction_budget` instructions. Undo with
@@ -546,7 +592,11 @@ pub fn applyLimits(self: State, memory_budget: ?usize, instruction_budget: ?u64)
         .memory = ctx.memory_limit,
         .instructions = ctx.instruction_limit,
         .set_instructions = instruction_budget != null,
+        .active = ctx.active_limits,
     };
+    if (memory_budget != null or instruction_budget != null) {
+        ctx.active_limits = .{ .memory = memory_budget, .instructions = instruction_budget };
+    }
     if (memory_budget) |budget| ctx.memory_limit = tighter(usize, ctx.memory_limit, ctx.memory_used +| budget);
     if (instruction_budget) |budget| {
         // The count starts over with the outermost call from Zig.
@@ -560,6 +610,7 @@ pub fn applyLimits(self: State, memory_budget: ?usize, instruction_budget: ?u64)
 pub fn restoreLimits(self: State, saved: SavedLimits) void {
     const ctx = self.ctx;
     ctx.memory_limit = saved.memory;
+    ctx.active_limits = saved.active;
     if (saved.set_instructions) {
         ctx.instruction_limit = saved.instructions;
         if (saved.instructions == null) {

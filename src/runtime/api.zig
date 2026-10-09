@@ -460,10 +460,42 @@ pub fn pushCClosure(L: *lua_State, f: CFunction, n: c_int) void {
 }
 
 pub fn pushCClosureNamed(L: *lua_State, f: CFunction, n: c_int, name: ?[*:0]const u8) void {
+    pushCClosureCont(L, f, n, name, null);
+}
+
+/// Luau: what runs once a call made through `callWithContinuation` has
+/// yielded and then returned. See `pushCClosureCont`.
+pub const LuauContinuation = luau.Continuation;
+
+/// Like `pushCClosureNamed`, with a continuation on Luau (made with
+/// `luauContinuation`), which lets calls that `f` makes through
+/// `callWithContinuation` yield. The other runtimes ignore `cont`: there the
+/// continuation goes to `lua_callk`.
+pub fn pushCClosureCont(L: *lua_State, f: CFunction, n: c_int, name: ?[*:0]const u8, cont: ?LuauContinuation) void {
     switch (lang) {
-        .luau => luau.lua_pushcclosurek(L, f, name, n, null),
+        .luau => luau.lua_pushcclosurek(L, f, name, n, cont),
         else => c.lua_pushcclosure(L, f, n),
     }
+}
+
+/// The Luau continuation that runs `k`, for `pushCClosureCont`.
+pub fn luauContinuation(comptime k: ContinuationFn) LuauContinuation {
+    return &LuauK(k).f;
+}
+
+fn LuauK(comptime k: ContinuationFn) type {
+    return struct {
+        fn f(L: ?*lua_State, status: c_int) callconv(.c) c_int {
+            // Errors in the call propagate to whoever resumes the coroutine;
+            // this only runs after a successful return.
+            _ = status;
+            // On the yield Luau cut the frame's stack limit down to where the
+            // function was; raising it again (as Luau's own pcall does) makes
+            // the results above it valid indices, with the usual free slots.
+            _ = checkStack(L.?, 20); // LUA_MINSTACK
+            return k(L.?, 0);
+        }
+    };
 }
 
 pub fn pushGlobalTable(L: *lua_State) void {
@@ -934,14 +966,18 @@ pub fn yieldValues(L: *lua_State, nresults: c_int) c_int {
     }
 }
 
-/// Continuation for `callWithContinuation`; receives the `ctx` given to it.
+/// Continuation for `callWithContinuation`: receives the `ctx` given to it,
+/// the number of values below the call's results (always 0 on Luau).
 pub const ContinuationFn = fn (L: *lua_State, ctx: isize) c_int;
 
 /// Calls the function below the top `nargs` values (keeping all results)
 /// and returns `k(L, ctx)`. Use as `return callWithContinuation(...)` from a
 /// C function. On 5.2+ the call may yield: `k` then runs once the coroutine
 /// is resumed and the call has returned, with the bound function's own frame
-/// gone. Elsewhere a yield inside the call is an error.
+/// gone. So it may on Luau when the C function was pushed with
+/// `pushCClosureCont(..., luauContinuation(k))`; there the `ctx` values
+/// below the function are dropped first. Elsewhere a yield inside the call
+/// is an error.
 pub fn callWithContinuation(L: *lua_State, nargs: c_int, ctx: isize, comptime k: ContinuationFn) c_int {
     switch (lang) {
         .lua52 => {
@@ -951,6 +987,18 @@ pub fn callWithContinuation(L: *lua_State, nargs: c_int, ctx: isize, comptime k:
         .lua53, .lua54, .lua55 => {
             c.lua_callk(L, nargs, c.LUA_MULTRET, ctx, &K53(k).f);
             return k(L, ctx);
+        },
+        .luau => {
+            // Luau gives the continuation no context, so the results must
+            // start at index 1: drop the `ctx` values below the function.
+            var i: isize = 0;
+            while (i < ctx) : (i += 1) remove(L, 1);
+            call(L, nargs, c.LUA_MULTRET);
+            // The call yielded, which it can when the calling C function has
+            // a continuation (`pushCClosureCont`): Luau runs that once the
+            // coroutine is resumed and the call returns.
+            if (c.lua_status(L) != 0) return -1;
+            return k(L, 0);
         },
         else => {
             call(L, nargs, c.LUA_MULTRET);
@@ -1034,6 +1082,16 @@ pub fn setStepHook(L: *lua_State, f: ?StepFn) void {
 /// Makes the step hook of thread `L` fire every `interval` instructions
 /// instead of `step_instructions`. Luau's interrupt already fires at every
 /// safepoint, so there it does nothing.
+/// Gives coroutine `co` the step hook set with `setStepHook`. PUC Lua hooks
+/// belong to each thread (a coroutine copies its creator's when created);
+/// LuaJIT's and Luau's are global, so there is nothing to do there.
+pub fn hookThread(co: *lua_State) void {
+    switch (lang) {
+        .luajit, .luau => {},
+        else => c.lua_sethook(co, &countHook, c.LUA_MASKCOUNT, @intCast(step_instructions)),
+    }
+}
+
 pub fn setStepInterval(L: *lua_State, interval: c_int) void {
     if (lang == .luau) return;
     c.lua_sethook(L, &countHook, c.LUA_MASKCOUNT, interval);

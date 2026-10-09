@@ -15,11 +15,16 @@
 //! Tasks can also wait for Zig work done through `std.Io`: a bound function
 //! starts it with `startJob` and yields the job, and the task resumes with
 //! the job's result once it is done (see `startJob`).
+//!
+//! A task can run under limits, like a sandbox call: `spawnLimited` takes
+//! them (`sandbox.limits`, say), and a task spawned by code that runs under
+//! limits (a sandbox call, a limited task) inherits them.
 
 const std = @import("std");
 const api = @import("../runtime/api.zig");
 const convert = @import("../binding/convert.zig");
 const State = @import("State.zig");
+const Sandbox = @import("Sandbox.zig");
 const ref = @import("ref.zig");
 const thread = @import("thread.zig");
 
@@ -45,6 +50,8 @@ spawn_handle_ref: c_int = 0,
 const Task = struct {
     thread: thread.Thread,
     wake: Wake,
+    /// Applied every time the task runs.
+    limits: ?Sandbox.Limits,
 };
 
 const Wake = union(enum) {
@@ -85,20 +92,30 @@ pub fn count(self: *const Scheduler) usize {
 }
 
 /// Starts `func` with the elements of the tuple `args` as a new task and
-/// runs it until it first waits.
+/// runs it until it first waits. It runs under the limits of the code that
+/// spawns it, if that runs under any (a sandbox call, a limited task).
 pub fn spawn(self: *Scheduler, func: ref.Function, args: anytype) error{OutOfMemory}!void {
+    return self.spawnLimited(func, args, self.state.activeLimits());
+}
+
+/// Like `spawn`, with `limits` applied every time the task runs, as for a
+/// call into a sandbox: each run until the task waits again may use that
+/// many instructions and bytes. Tasks it spawns inherit them.
+///
+///     try scheduler.spawnLimited(level, .{}, sandbox.limits);
+pub fn spawnLimited(self: *Scheduler, func: ref.Function, args: anytype, limits: ?Sandbox.Limits) error{OutOfMemory}!void {
     const t = self.state.newThread(func);
     const co = t.state.L;
     if (!api.checkStack(co, convert.resultCount(@TypeOf(args)) + 4)) {
         t.deinit();
         return error.OutOfMemory;
     }
-    const wake = self.step(t, convert.pushMulti(co, args)) orelse {
+    const wake = self.step(t, convert.pushMulti(co, args), limits) orelse {
         t.deinit();
         return;
     };
     // Appended after running: the task may have spawned tasks of its own.
-    self.tasks.append(self.gpa, .{ .thread = t, .wake = wake }) catch |err| {
+    self.tasks.append(self.gpa, .{ .thread = t, .wake = wake, .limits = limits }) catch |err| {
         t.deinit();
         return err;
     };
@@ -130,7 +147,7 @@ pub fn update(self: *Scheduler, now: f64) void {
             },
         };
         // Index, not pointer: running the task may grow the list.
-        if (self.step(task.thread, nargs)) |wake| {
+        if (self.step(task.thread, nargs, task.limits)) |wake| {
             self.tasks.items[i].wake = wake;
             i += 1;
         } else {
@@ -140,11 +157,15 @@ pub fn update(self: *Scheduler, now: f64) void {
     }
 }
 
-/// Resumes a task with `nargs` values pushed onto its stack and works out
-/// what it waits for next. Returns null when it is finished.
-fn step(self: *Scheduler, t: thread.Thread, nargs: c_int) ?Wake {
+/// Resumes a task with `nargs` values pushed onto its stack, under its
+/// `limits`, and works out what it waits for next. Returns null when it is
+/// finished.
+fn step(self: *Scheduler, t: thread.Thread, nargs: c_int, limits: ?Sandbox.Limits) ?Wake {
     const co = t.state.L;
-    const result = t.resumeRaw(nargs) catch |err| {
+    const saved = if (limits) |l| self.state.applyLimits(l.memory, l.instructions) else null;
+    const resumed = t.resumeRaw(nargs);
+    if (saved) |s| self.state.restoreLimits(s);
+    const result = resumed catch |err| {
         self.report(self.state.errorMessage(), err);
         return null;
     };
