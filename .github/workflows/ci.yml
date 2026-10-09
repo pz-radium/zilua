@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A newer push to the same branch or pull request cancels the older run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, ${{ matrix.lang }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        lang: [lua51, lua52, lua53, lua54, lua55, luajit, luau]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - run: zig build test -Dlang=${{ matrix.lang }} --summary all
+      - run: zig build test -Dlang=${{ matrix.lang }} -Doptimize=safe --summary all
+      - run: zig build examples -Dlang=${{ matrix.lang }}
+
+  # 32-bit: x86 binaries run on the 64-bit Windows runners.
+  x86:
+    name: test (x86-windows, ${{ matrix.lang }})
+    strategy:
+      fail-fast: false
+      matrix:
+        lang: [lua51, lua54, lua55, luajit, luau]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - run: zig build test -Dlang=${{ matrix.lang }} -Dtarget=x86-windows --summary all
+
+  # The Lua C module example, loaded by a real Lua interpreter.
+  module:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - run: sudo apt-get update && sudo apt-get install -y lua5.4
+      - run: zig build module -Dlang=lua54 -Doptimize=safe
+      - run: >
+          lua5.4 -e 'package.cpath = "zig-out/lib/lib?.so;" .. package.cpath;
+          local vec = require("vec");
+          assert(vec.length(3, 4) == 5);
+          local x, y = vec.normalize(3, 4);
+          assert(math.abs(x - 0.6) < 1e-9 and math.abs(y - 0.8) < 1e-9);
+          assert(vec.runtime() == "lua54");
+          print("module ok")'
+
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - run: zig fmt --check src build build.zig build.zig.zon examples

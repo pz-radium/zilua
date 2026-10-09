@@ -1,0 +1,53 @@
+.{
+    .name = .zilua,
+    .version = "0.1.0",
+    .fingerprint = 0x1a5e59c323a990b3,
+    .minimum_zig_version = "0.17.0",
+    // One lazy dependency per runtime: only the one selected with -Dlang is
+    // fetched. Added with `zig fetch --save=luaXY <url>`.
+    .dependencies = .{
+        .lua51 = .{
+            .url = "https://www.lua.org/ftp/lua-5.1.5.tar.gz",
+            .hash = "N-V-__8AABAhDAAIlXL7OA-0Z5sWQh_FOFGoImvOvJzkRGOg",
+            .lazy = true,
+        },
+        .lua52 = .{
+            .url = "https://www.lua.org/ftp/lua-5.2.4.tar.gz",
+            .hash = "N-V-__8AALg2DgDVsrOXOPBkTZ7Vt0MZc_Gha5N--G1M-FiH",
+            .lazy = true,
+        },
+        .lua53 = .{
+            .url = "https://www.lua.org/ftp/lua-5.3.6.tar.gz",
+            .hash = "N-V-__8AALihEACTeiI1Me9rP-qPZT3BNTELDoSAXn76FIhw",
+            .lazy = true,
+        },
+        .lua54 = .{
+            .url = "https://www.lua.org/ftp/lua-5.4.9.tar.gz",
+            .hash = "N-V-__8AAEQ_FAAnte7Oq7KSLG9FZh_9mjvQimoekgYqkKSK",
+            .lazy = true,
+        },
+        .lua55 = .{
+            .url = "https://www.lua.org/ftp/lua-5.5.1.tar.gz",
+            .hash = "N-V-__8AAPqeFQDipy0CdI6MKBmwYYarybBTO3IIJPrSzH_w",
+            .lazy = true,
+        },
+        .luajit = .{
+            .url = "https://github.com/LuaJIT/LuaJIT/archive/c6ffc141a8762b41703f9287d63d93622a13dd8f.tar.gz",
+            .hash = "N-V-__8AAMWIQwCGw4eqOoJrHtVD_Y9ncbO7UOh1zLkDTMva",
+            .lazy = true,
+        },
+        .luau = .{
+            .url = "https://github.com/luau-lang/luau/archive/refs/tags/0.741.tar.gz",
+            .hash = "N-V-__8AAMLiIAHgDKa99jE3-4juVxcs-gFXoSfz_Q1Y7LqB",
+            .lazy = true,
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "build",
+        "src",
+        "LICENSE",
+        "README.md",
+    },
+}

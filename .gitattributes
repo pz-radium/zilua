@@ -1,0 +1,2 @@
+# Sources must use LF only (no CR), on every platform and checkout.
+* text=auto eol=lf
