@@ -283,6 +283,24 @@ pub const LUA_MASKCOUNT: c_int = 1 << 3;
 /// Returns int before 5.3 and void after; declared void, the result is unused.
 pub extern fn lua_sethook(L: *lua_State, func: ?Hook, mask: c_int, count: c_int) void;
 pub extern fn lua_setupvalue(L: *lua_State, funcindex: c_int, n: c_int) ?[*:0]const u8;
+pub extern fn lua_getstack(L: *lua_State, level: c_int, ar: *anyopaque) c_int;
+pub extern fn lua_getinfo(L: *lua_State, what: [*:0]const u8, ar: *anyopaque) c_int; // not Luau
+
+/// `lua_Debug` of Lua 5.1, for the traceback it lacks (`api.traceback`).
+/// The layout differs in every other version.
+pub const Debug51 = extern struct {
+    event: c_int,
+    name: ?[*:0]const u8,
+    namewhat: [*:0]const u8,
+    what: [*:0]const u8,
+    source: [*:0]const u8,
+    currentline: c_int,
+    nups: c_int,
+    linedefined: c_int,
+    lastlinedefined: c_int,
+    short_src: [60]u8, // LUA_IDSIZE
+    i_ci: c_int,
+};
 
 /// LuaJIT only (luajit.h).
 pub extern fn luaJIT_setmode(L: *lua_State, idx: c_int, mode: c_int) c_int;

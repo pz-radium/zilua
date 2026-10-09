@@ -235,6 +235,9 @@ const JobHeader = struct {
 /// result of the bound function's call: its value(s), `zilua.Owned` results
 /// freed after pushing, or `nil, "ErrorName"` for an error.
 ///
+/// Fails with `error.NoSchedulerIo` while `io` is not set (the state's own
+/// `std.Io`, from `State.setIo`, is not used here).
+///
 /// `function` runs on another thread and must not touch the Lua state.
 /// Copy any Lua strings it needs into its arguments: they are not kept alive.
 ///
@@ -242,8 +245,8 @@ const JobHeader = struct {
 ///         const scheduler = zilua.Scheduler.of(lua) orelse return lua.fail("no scheduler");
 ///         return zilua.yield(try scheduler.startJob(slowWork, .{n}));
 ///     }
-pub fn startJob(self: *Scheduler, comptime function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) error{ OutOfMemory, NoIo }!Job {
-    const io = self.io orelse return error.NoIo;
+pub fn startJob(self: *Scheduler, comptime function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) error{ OutOfMemory, NoSchedulerIo }!Job {
+    const io = self.io orelse return error.NoSchedulerIo;
     const Impl = JobImpl(function);
     const impl = try self.gpa.create(Impl);
     errdefer self.gpa.destroy(impl);

@@ -193,7 +193,7 @@ fn Trampoline(comptime f: anytype) type {
                 } else if (T == std.Io) {
                     params[i] = State.fromLua(L).io() orelse {
                         releaseParams(params, read);
-                        return error.NoIo;
+                        return error.NoStateIo;
                     };
                 } else if (T == Args) {
                     const start = first + offset;
@@ -285,8 +285,12 @@ fn fail(L: *lua_State, err: anyerror, diag: Diagnostic) noreturn {
         }
         api.raise(L);
     }
-    if (err == error.NoIo) {
-        _ = api.raiseF(L, "this function needs std.Io: call State.setIo first");
+    if (err == error.NoStateIo) {
+        _ = api.raiseF(L, "this function takes a std.Io: call State.setIo first");
+        unreachable;
+    }
+    if (err == error.NoSchedulerIo) {
+        _ = api.raiseF(L, "Scheduler.startJob needs a std.Io: set Scheduler.io first");
         unreachable;
     }
     if (diag.arg != 0) {

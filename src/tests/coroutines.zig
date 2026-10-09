@@ -78,6 +78,7 @@ test "errors inside a coroutine are returned by run" {
     try testing.expectEqual(1, (try co.run(i64, .{})).yielded);
     try testing.expectError(error.Runtime, co.run(void, .{}));
     try expectContains(lua.errorMessage(), "broken here");
+    if (zilua.lang != .luau) try expectContains(lua.errorMessage(), "stack traceback:");
     try testing.expectEqual(.dead, co.status());
 }
 
@@ -167,6 +168,32 @@ const jobs = struct {
         return zilua.yield(try scheduler.startJob(failing, .{}));
     }
 };
+
+test "Scheduler: jobs need Scheduler.io, not the state's std.Io" {
+    const Errors = struct {
+        var seen: u32 = 0;
+
+        fn onError(state: zilua.State, message: []const u8) void {
+            _ = state;
+            if (helpers.contains(message, "set Scheduler.io first")) seen += 1;
+        }
+    };
+    const lua = try open();
+    defer lua.deinit();
+    lua.setIo(testing.io);
+    var scheduler: zilua.Scheduler = .init(lua, testing.allocator);
+    defer scheduler.deinit();
+    scheduler.attach();
+    scheduler.on_error = Errors.onError;
+    lua.setGlobal("compute", jobs.compute);
+
+    try run(lua, "function task() compute(1) end");
+    const task = try lua.getGlobal(zilua.Function, "task");
+    defer task.deinit();
+    try scheduler.spawn(task, .{});
+    try testing.expectEqual(0, scheduler.count());
+    try testing.expectEqual(1, Errors.seen);
+}
 
 test "Scheduler: tasks wait for std.Io jobs" {
     const io = testing.io;

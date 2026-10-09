@@ -29,9 +29,6 @@ pub const has_integers = lang.hasIntegers();
 /// (`newUserdataDtor`) instead of a `__gc` metamethod. Luau has no `__gc`.
 pub const has_userdata_dtor = lang == .luau;
 
-/// Whether `traceback` produces a real stack traceback (no `luaL_traceback` in 5.1).
-pub const has_traceback = lang != .lua51;
-
 /// Whether `setUserValue` only accepts tables (the 5.1 environment, and 5.2,
 /// which allows a table or nil).
 pub const user_value_must_be_table = switch (lang) {
@@ -819,13 +816,54 @@ pub fn where(L: *lua_State, lvl: c_int) void {
     c.luaL_where(L, lvl);
 }
 
-/// Pushes a traceback of `L1` prefixed with `msg`. 5.1 has no
-/// `luaL_traceback`, so there the message is pushed as is.
+/// Pushes a traceback of `L1`, from call `level` down, prefixed with `msg`.
 pub fn traceback(L: *lua_State, L1: *lua_State, msg: ?[*:0]const u8, level: c_int) void {
     switch (lang) {
-        .lua51 => c.lua_pushstring(L, msg),
+        .lua51 => traceback51(L, L1, msg, level),
         else => c.luaL_traceback(L, L1, msg, level),
     }
+}
+
+/// `luaL_traceback` for Lua 5.1, which lacks it. A port of 5.1's
+/// `debug.traceback` (`db_errorfb` in ldblib.c), so the output looks the same,
+/// but it does not need the debug library to be open.
+fn traceback51(L: *lua_State, L1: *lua_State, msg: ?[*:0]const u8, first_level: c_int) void {
+    const levels1 = 12; // calls shown before a "..."
+    const levels2 = 10; // calls shown after it
+    const top = c.lua_gettop(L);
+    if (msg) |m| _ = c.lua_pushfstring(L, "%s\n", m);
+    c.lua_pushstring(L, "stack traceback:");
+    var ar: c.Debug51 = undefined;
+    var level = first_level;
+    var first_part = true;
+    while (c.lua_getstack(L1, level, &ar) != 0) {
+        level += 1;
+        if (level > levels1 and first_part) {
+            first_part = false;
+            if (c.lua_getstack(L1, level + levels2, &ar) == 0) {
+                level -= 1; // few calls left: show them all
+            } else {
+                c.lua_pushstring(L, "\n\t...");
+                while (c.lua_getstack(L1, level + levels2, &ar) != 0) level += 1;
+            }
+            continue;
+        }
+        _ = c.lua_getinfo(L1, "Snl", &ar);
+        const src: [*:0]const u8 = @ptrCast(&ar.short_src);
+        _ = c.lua_pushfstring(L, "\n\t%s:", src);
+        if (ar.currentline > 0) _ = c.lua_pushfstring(L, "%d:", ar.currentline);
+        if (ar.namewhat[0] != 0) {
+            _ = c.lua_pushfstring(L, " in function '%s'", ar.name orelse "?");
+        } else if (ar.what[0] == 'm') {
+            c.lua_pushstring(L, " in main chunk");
+        } else if (ar.what[0] == 'C' or ar.what[0] == 't') {
+            c.lua_pushstring(L, " ?"); // C function or tail call
+        } else {
+            _ = c.lua_pushfstring(L, " in function <%s:%d>", src, ar.linedefined);
+        }
+        c.lua_concat(L, c.lua_gettop(L) - top);
+    }
+    c.lua_concat(L, c.lua_gettop(L) - top);
 }
 
 /// Pops the top value and stores it in table `t`, returning a reference key.

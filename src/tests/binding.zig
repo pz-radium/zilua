@@ -105,7 +105,7 @@ test "allocator and std.Io parameters are injected" {
 
     lua.setGlobal("withIo", funcs.withIo);
     try testing.expectError(error.Runtime, lua.doString("withIo()"));
-    try expectContains(lua.errorMessage(), "std.Io");
+    try expectContains(lua.errorMessage(), "call State.setIo first");
     lua.setIo(testing.io);
     try run(lua, "assert(withIo() == 7)");
 }

@@ -105,7 +105,6 @@ still differ:
   the targets that need them).
 - Lua 5.1, 5.2, LuaJIT and Luau have no integer subtype: integers above 2^53
   lose precision, and argument errors say "number expected".
-- On Lua 5.1, error messages come without a traceback.
 
 To update a runtime, point its entry in `build.zig.zon` at the new release.
 `zig fetch --save=<name>` replaces the URL and hash and keeps the entry lazy:

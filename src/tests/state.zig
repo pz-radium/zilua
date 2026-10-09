@@ -42,6 +42,30 @@ test "syntax and runtime errors carry messages" {
     try run(lua, "y = 1");
 }
 
+test "runtime errors carry a traceback on every runtime" {
+    const lua = try open();
+    defer lua.deinit();
+
+    try testing.expectError(error.Runtime, lua.doString(
+        \\local function inner() error('deep') end
+        \\local function outer() inner() end
+        \\outer()
+    ));
+    const message = lua.errorMessage();
+    try expectContains(message, "deep");
+    try expectContains(message, "inner");
+    // Luau has its own format, without a header.
+    if (zilua.lang != .luau) try expectContains(message, "stack traceback:");
+
+    // Long stacks are cut in the middle.
+    try testing.expectError(error.Runtime, lua.doString(
+        \\local function down(n) if n == 0 then error('bottom') end down(n - 1) return n end
+        \\down(40)
+    ));
+    if (zilua.lang != .luau) try expectContains(lua.errorMessage(), "\n\t...");
+    try testing.expectEqual(0, lua.getTop());
+}
+
 test "call Lua functions" {
     const lua = try open();
     defer lua.deinit();
