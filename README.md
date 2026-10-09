@@ -183,7 +183,8 @@ type the first time:
 - fields are read and assigned by name, with type checks (`v.x = 3`)
 - `__add`, `__eq`, `__lt`, `__len`, `__call`, `__concat`, ... become metamethods
 - `T.zilua_name` sets the name Lua sees
-- `deinit` is never callable from Lua
+- `deinit` is never callable from Lua, and `getmetatable(value)` returns the
+  type name: scripts cannot reach or change the metatable
 
 Fields and functions whose types zilua cannot convert are skipped, not
 reported as compile errors.
@@ -204,6 +205,8 @@ reported as compile errors.
 | tuple, array, slice | sequence |
 | `zilua.asTable(value)` | table of the struct's fields |
 | `zilua.Table`, `Function`, `Thread`, `Ref` | handles that keep a Lua value alive |
+
+Slices are read from sequences: a `nil` before the end is an error.
 
 A struct can also be read from a Lua table, field by field. A missing field
 takes its default value, or `null` if it is optional; otherwise the read
@@ -308,11 +311,18 @@ try sandbox.call(void, "on_event", .{event});
   `require`, `load`, `dofile`, `print` and most of `os` are absent (give it
   what it needs with `set`), and globals a script defines stay inside the
   sandbox.
-- Precompiled chunks are rejected.
+- Precompiled chunks are rejected (by every zilua function that loads code,
+  sandbox or not).
+- `setmetatable` refuses `__gc` metamethods, which would run later, outside
+  the sandbox's limits.
 - Over the memory limit, allocations fail with "not enough memory". Over the
   instruction limit, every following instruction raises, so `pcall` cannot
   keep a runaway loop alive. LuaJIT's JIT compiler is off while an
   instruction limit is set.
+- The instruction limit counts Lua instructions, not the time spent inside a
+  single library call such as pattern matching on a long string: it bounds
+  what a script does, not wall-clock time. For a hard time limit, run
+  untrusted scripts in a separate process.
 - On Luau the library copies are read-only, `.luau_fast_builtins = true`
   enables Luau's safe-environment fast paths, and `lua.freezeGlobals()`
   makes the shared globals read-only.

@@ -637,7 +637,10 @@ fn luaAlloc(ud: ?*anyopaque, ptr: ?*anyopaque, osize: usize, nsize: usize) callc
     }
     if (nsize > old_size) {
         if (ctx.memory_limit) |limit| {
-            if (ctx.memory_used - old_size + nsize > limit) return null;
+            // Written so that nothing overflows, whatever size Lua asks for
+            // (close to 4 GiB is possible on 32-bit targets).
+            const grow = nsize - old_size;
+            if (ctx.memory_used > limit or grow > limit - ctx.memory_used) return null;
         }
     }
     const new = reallocate(gpa, ptr, old_size, nsize, alignment, ret_addr) orelse return null;

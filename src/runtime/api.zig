@@ -774,9 +774,10 @@ fn luauLoad(L: *lua_State, chunkname: [*:0]const u8, bytecode: []const u8) Statu
 
 pub fn loadFile(L: *lua_State, path: [*:0]const u8, mode: LoadMode) Status {
     switch (lang) {
-        .lua51 => return toStatus(c.luaL_loadfile(L, path)),
-        .luau => {
-            // No luaL_loadfile: read the file into a Lua string with C stdio.
+        .lua51, .luau => {
+            // Luau has no luaL_loadfile, and 5.1's takes no mode, so it would
+            // load a binary chunk. Read the file into a Lua string with C
+            // stdio and load it like a buffer, which checks the mode.
             const file = std.c.fopen(path, "rb") orelse {
                 _ = pushFString(L, "cannot open %s", path);
                 return .file;
@@ -791,7 +792,13 @@ pub fn loadFile(L: *lua_State, path: [*:0]const u8, mode: LoadMode) Status {
                 pushString(L, chunk[0..n]);
                 concat(L, 2);
             }
-            const status = loadBuffer(L, toLString(L, -1).?, toCString(L, -2).?, mode);
+            // Like luaL_loadfile, skip a first line starting with '#' (a
+            // shebang), keeping its newline so line numbers stay right.
+            var source = toLString(L, -1).?;
+            if (source.len > 0 and source[0] == '#') {
+                source = source[std.mem.indexOfScalar(u8, source, '\n') orelse source.len ..];
+            }
+            const status = loadBuffer(L, source, toCString(L, -2).?, mode);
             // Drop the chunk name and the source below the result.
             remove(L, -2);
             remove(L, -2);

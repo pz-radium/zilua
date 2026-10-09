@@ -37,6 +37,10 @@ now: f64 = 0,
 /// Called with the message (and traceback) of a task that failed, before
 /// the task is dropped.
 on_error: ?*const fn (state: State, message: []const u8) void = null,
+/// Lua-owned cell through which `spawn` functions reach this scheduler;
+/// `deinit` empties it, so scripts that still call them get an error.
+spawn_handle: ?*?*Scheduler = null,
+spawn_handle_ref: c_int = 0,
 
 const Task = struct {
     thread: thread.Thread,
@@ -54,8 +58,18 @@ pub fn init(state: State, gpa: std.mem.Allocator) Scheduler {
     return .{ .state = state, .gpa = gpa };
 }
 
-/// Drops every task. Jobs still running are canceled and awaited.
+/// Drops every task. Jobs still running are canceled and awaited. Lua
+/// functions from `registerSpawn` raise an error from now on.
 pub fn deinit(self: *Scheduler) void {
+    const L = self.state.L;
+    if (self.spawn_handle) |handle| {
+        handle.* = null;
+        api.unref(L, api.registry_index, self.spawn_handle_ref);
+    }
+    if (of(self.state) == self) {
+        api.pushNil(L);
+        api.rawSetP(L, api.registry_index, &registry_key);
+    }
     for (self.tasks.items) |task| task.thread.deinit();
     self.tasks.deinit(self.gpa);
     for (self.jobs.items) |job| {
@@ -145,7 +159,17 @@ fn step(self: *Scheduler, t: thread.Thread, nargs: c_int) ?Wake {
         .light_userdata => {
             const ptr = api.toUserdata(co, first);
             for (self.jobs.items) |job| {
-                if (@as(?*anyopaque, job) == ptr) return .{ .job = job };
+                if (@as(?*anyopaque, job) != ptr) continue;
+                // A script can get hold of a job (by calling the function
+                // that starts it in a coroutine of its own) and yield it from
+                // several tasks. Only one may wait: the job is freed once it
+                // has handed its result over.
+                if (job.claimed) {
+                    self.report("task yielded a job that another task is already waiting for", null);
+                    return null;
+                }
+                job.claimed = true;
+                return .{ .job = job };
             }
         },
         else => {},
@@ -176,14 +200,24 @@ fn wait(seconds: ?f64) thread.Yield(?f64) {
 pub fn registerSpawn(self: *Scheduler, name: [:0]const u8) void {
     self.attach();
     const L = self.state.L;
-    api.pushLightUserdata(L, self);
+    if (self.spawn_handle) |handle| {
+        _ = api.rawGetI(L, api.registry_index, self.spawn_handle_ref);
+        std.debug.assert(handle.* == self);
+    } else {
+        const handle: *?*Scheduler = @ptrCast(@alignCast(api.newUserdata(L, @sizeOf(?*Scheduler))));
+        handle.* = self;
+        api.pushValue(L, -1);
+        self.spawn_handle_ref = api.ref(L, api.registry_index);
+        self.spawn_handle = handle;
+    }
     api.pushCClosureNamed(L, spawnFromLua, 1, name.ptr);
     api.setGlobal(L, name.ptr);
 }
 
 fn spawnFromLua(L_: ?*api.lua_State) callconv(.c) c_int {
     const L = L_.?;
-    const self: *Scheduler = @ptrCast(@alignCast(api.toUserdata(L, api.upvalueIndex(1)).?));
+    const handle: *?*Scheduler = @ptrCast(@alignCast(api.toUserdata(L, api.upvalueIndex(1)).?));
+    const self = handle.* orelse return api.raiseF(L, "the scheduler behind this function is gone");
     if (api.typeOf(L, 1) != .function) return api.raiseArgError(L, 1, "function expected");
     const func = ref.Function.fromStack(State.fromLua(L), 1);
     const result = self.spawn(func, .{});
@@ -223,6 +257,8 @@ pub const Job = struct {
 
 const JobHeader = struct {
     done: std.atomic.Value(bool) = .init(false),
+    /// A task waits for this job (see `step`).
+    claimed: bool = false,
     /// Awaits the work and pushes its result onto `L`; returns how many values.
     finish: *const fn (header: *JobHeader, io: std.Io, L: *api.lua_State) c_int,
     cancel: *const fn (header: *JobHeader, io: std.Io) void,

@@ -18,11 +18,23 @@ local env = {}
 for _, name in ipairs({
   "assert", "error", "ipairs", "next", "pairs", "pcall", "select",
   "tonumber", "tostring", "type", "typeof", "unpack", "xpcall",
-  "rawequal", "rawget", "rawlen", "setmetatable",
+  "rawequal", "rawget", "rawlen",
 }) do
   env[name] = _G[name]
 end
 env._VERSION = _VERSION
+
+-- A __gc metamethod would run whenever the host collects garbage, outside
+-- the sandbox's limits (Lua 5.2 and later finalize tables). The field counts
+-- when setmetatable is called, raw and whatever its value (even false), so
+-- that is where it is refused.
+local setmetatable, rawget, type, error = setmetatable, rawget, type, error
+env.setmetatable = function(t, mt)
+  if type(mt) == "table" and rawget(mt, "__gc") ~= nil then
+    error("__gc metamethods are not allowed in a sandbox", 2)
+  end
+  return setmetatable(t, mt)
+end
 
 -- Metatables of strings and userdata are shared with the host (and with
 -- other sandboxes), so only table metatables are visible.

@@ -42,6 +42,32 @@ test "syntax and runtime errors carry messages" {
     try run(lua, "y = 1");
 }
 
+test "doFile skips a shebang line and refuses precompiled chunks" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "script.lua", .data = "#!/usr/bin/env lua\nvalue = 3\n" });
+    var script_buf: [128]u8 = undefined;
+    const script = try std.fmt.bufPrintSentinel(&script_buf, ".zig-cache/tmp/{s}/script.lua", .{&tmp.sub_path}, 0);
+
+    const lua = try open();
+    defer lua.deinit();
+    try lua.doFile(script);
+    try testing.expectEqual(3, try lua.getGlobal(i64, "value"));
+
+    if (zilua.lang == .luau) return; // no string.dump to make a chunk with
+    var chunk_buf: [128]u8 = undefined;
+    const chunk = try std.fmt.bufPrintSentinel(&chunk_buf, ".zig-cache/tmp/{s}/chunk.out", .{&tmp.sub_path}, 0);
+    lua.setGlobal("path", chunk);
+    try run(lua,
+        \\local f = assert(io.open(path, "wb"))
+        \\f:write(string.dump(function() return 1 end))
+        \\f:close()
+    );
+    if (lua.doFile(chunk)) |_| return error.TestUnexpectedResult else |_| {}
+    try expectContains(lua.errorMessage(), "mode");
+}
+
 test "runtime errors carry a traceback on every runtime" {
     const lua = try open();
     defer lua.deinit();

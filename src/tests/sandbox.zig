@@ -8,6 +8,41 @@ const open = helpers.open;
 const run = helpers.run;
 const expectContains = helpers.expectContains;
 
+test "sandboxed code cannot set __gc metamethods" {
+    const lua = try open();
+    defer lua.deinit();
+    const sandbox = try lua.newSandbox(.{});
+    defer sandbox.deinit();
+
+    try sandbox.doString(
+        \\assert(not pcall(setmetatable, {}, { __gc = function() end }))
+        \\assert(not pcall(setmetatable, {}, { __gc = false }))
+        \\local t = setmetatable({}, { __index = { x = 1 } })
+        \\assert(t.x == 1 and getmetatable(t) ~= nil)
+    );
+}
+
+test "huge allocations fail cleanly under a memory limit" {
+    const lua = try open();
+    defer lua.deinit();
+    const sandbox = try lua.newSandbox(.{ .limits = .{ .memory = 1 << 20 } });
+    defer sandbox.deinit();
+
+    // Close to 4 GiB, near the top of the address space on 32-bit targets,
+    // in one allocation from 5.3 on. Elsewhere string.rep takes a C int.
+    const size: i64 = if (zilua.api.has_integers) 4294967000 else 2147483000;
+    try sandbox.set("size", size);
+    try testing.expect(std.meta.isError(sandbox.doString("local s = string.rep('x', size)")));
+    if (zilua.lang == .lua55) {
+        // table.create asks for the whole array part at once: sizes up to
+        // the address space on 32-bit targets.
+        try sandbox.doString(
+            \\for n = 4, 32 do pcall(table.create, math.floor((2 ^ 32 - 1) / n)) end
+        );
+    }
+    try run(lua, "x = 1");
+}
+
 test "sandboxed code cannot reach the host" {
     const lua = try open();
     defer lua.deinit();

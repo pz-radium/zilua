@@ -9,6 +9,12 @@
 //! The limits apply to every call made through the sandbox, on top of the
 //! state's own (`State.setMemoryLimit`, `State.setInstructionLimit`): the
 //! stricter one wins.
+//!
+//! The instruction limit counts Lua instructions. Lua runs no hook inside a
+//! C function, so the time one library call takes (pattern matching on a
+//! long string, for instance) is not counted: the limit bounds what a script
+//! does, not wall-clock time. For a hard time limit, run untrusted scripts in
+//! a separate process.
 
 const std = @import("std");
 const api = @import("../runtime/api.zig");

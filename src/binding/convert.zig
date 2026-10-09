@@ -711,7 +711,16 @@ pub fn toAlloc(comptime T: type, gpa: std.mem.Allocator, L: *lua_State, idx: c_i
         .pointer => |p| {
             if (api.typeOf(L, idx) != .table) return error.TypeMismatch;
             const t = api.absIndex(L, idx);
-            const items = try gpa.alloc(p.child, api.rawLen(L, t));
+            // #t can be far larger than the number of elements (keys 1, 2,
+            // 4, ..., 2^30 make a border at 2^30), so make sure the sequence
+            // has no holes before allocating for it.
+            const len = api.rawLen(L, t);
+            for (0..len) |k| {
+                const ty = api.rawGetI(L, t, @intCast(k + 1));
+                api.pop(L, 1);
+                if (ty == .nil) return error.TypeMismatch;
+            }
+            const items = try gpa.alloc(p.child, len);
             var filled: usize = 0;
             errdefer {
                 for (items[0..filled]) |item| free(gpa, item);

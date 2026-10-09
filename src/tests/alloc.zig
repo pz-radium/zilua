@@ -28,6 +28,23 @@ test "getGlobalAlloc copies strings and slices" {
     try testing.expectEqualSlices(i64, &.{ 1, 2, 3 }, nums);
 }
 
+test "slices come from sequences without holes" {
+    const lua = try open();
+    defer lua.deinit();
+
+    // Keys 1, 2, 4, ..., 2^30: #t can be as large as 2^30 with 31 elements.
+    // The read must fail at the first hole, before allocating for #t.
+    try run(lua,
+        \\sparse = {}
+        \\for k = 0, 30 do sparse[2 ^ k] = k end
+        \\list = { 1, 2, 3 }
+    );
+    try testing.expectError(error.TypeMismatch, lua.getGlobalAlloc(gpa, []i64, "sparse"));
+    const list = try lua.getGlobalAlloc(gpa, []i64, "list");
+    defer zilua.free(gpa, list);
+    try testing.expectEqualSlices(i64, &.{ 1, 2, 3 }, list);
+}
+
 test "structs with string fields come from tables" {
     const Item = struct {
         name: []const u8,

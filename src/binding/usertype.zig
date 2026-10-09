@@ -25,6 +25,9 @@ pub const Header = extern struct {
     owned: bool,
     /// Created from a `*const T`: Lua may read the value but not modify it.
     read_only: bool,
+    /// The finalizer has run. The userdata can still be reachable (a later
+    /// finalizer may resurrect it), but its value must not be used any more.
+    finalized: bool = false,
 };
 
 /// Registry name of the metatable of `T` (as with `luaL_newmetatable`, for
@@ -194,7 +197,13 @@ pub fn check(L: *lua_State, comptime T: type, idx: c_int) ?*Header {
     const same = api.rawEqual(L, -1, -2);
     api.pop(L, 2);
     if (!same) return null;
-    return @ptrCast(@alignCast(api.toUserdata(L, idx).?));
+    return live(L, idx);
+}
+
+/// The header of the zilua userdata at `idx`, or null once it is finalized.
+fn live(L: *lua_State, idx: c_int) ?*Header {
+    const header: *Header = @ptrCast(@alignCast(api.toUserdata(L, idx).?));
+    return if (header.finalized) null else header;
 }
 
 /// Like `check`, comparing with the metatable at `mt` (an upvalue of the
@@ -205,7 +214,7 @@ fn checkWith(L: *lua_State, idx: c_int, mt: c_int) ?*Header {
     const same = api.rawEqual(L, -1, mt);
     api.pop(L, 1);
     if (!same) return null;
-    return @ptrCast(@alignCast(api.toUserdata(L, idx).?));
+    return live(L, idx);
 }
 
 /// Makes the userdata at `child` keep the value at `parent` alive, for
@@ -238,6 +247,10 @@ pub fn pushMetatable(L: *lua_State, comptime T: type) void {
 
     api.pushString(L, displayName(T));
     api.setField(L, mt, "__name");
+    // getmetatable() returns the name instead, so scripts can neither call
+    // __gc themselves nor change the metatable every value shares.
+    api.pushString(L, displayName(T));
+    api.setField(L, mt, "__metatable");
     if (comptime api.lang == .luau) {
         // What Luau's typeof() returns.
         api.pushString(L, displayName(T));
@@ -408,8 +421,10 @@ fn dtorFn(comptime T: type) api.Destructor {
 
 fn finalize(comptime T: type, header: *Header, deferred: bool) void {
     if (!header.owned) return;
-    // Finalize once, even if a later finalizer resurrects the object.
+    // Finalize once, even if a later finalizer resurrects the object, and
+    // make every later use of it fail (`check`).
     header.owned = false;
+    header.finalized = true;
     const self: *T = @ptrCast(@alignCast(header.ptr));
     switch (comptime finalizer(T)) {
         .gc_decl => T.__gc(self),

@@ -195,6 +195,55 @@ test "Scheduler: jobs need Scheduler.io, not the state's std.Io" {
     try testing.expectEqual(1, Errors.seen);
 }
 
+test "Scheduler: only one task can wait for a job" {
+    const Errors = struct {
+        var seen: u32 = 0;
+
+        fn onError(state: zilua.State, message: []const u8) void {
+            _ = state;
+            if (helpers.contains(message, "already waiting")) seen += 1;
+        }
+    };
+    const io = testing.io;
+    const lua = try open();
+    defer lua.deinit();
+    var scheduler: zilua.Scheduler = .init(lua, testing.allocator);
+    defer scheduler.deinit();
+    scheduler.io = io;
+    scheduler.on_error = Errors.onError;
+    scheduler.registerSpawn("spawn");
+    lua.setGlobal("compute", jobs.compute);
+
+    // Run in a coroutine of the script's own, compute hands the job to the
+    // script, which then yields it from two tasks.
+    try run(lua,
+        \\local job = coroutine.wrap(function() local j = compute(21) return j end)()
+        \\spawn(function() result = coroutine.yield(job) end)
+        \\spawn(function() coroutine.yield(job) end)
+    );
+    try testing.expectEqual(1, Errors.seen);
+    try testing.expectEqual(1, scheduler.count());
+    var spins: usize = 0;
+    while (scheduler.count() > 0 and spins < 5000) : (spins += 1) {
+        scheduler.update(0);
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try testing.expectEqual(42, try lua.getGlobal(i64, "result"));
+}
+
+test "Scheduler: spawn fails once its scheduler is gone" {
+    const lua = try open();
+    defer lua.deinit();
+    {
+        var scheduler: zilua.Scheduler = .init(lua, testing.allocator);
+        scheduler.registerSpawn("spawn");
+        scheduler.deinit();
+    }
+    try testing.expectError(error.Runtime, lua.doString("spawn(function() end)"));
+    try expectContains(lua.errorMessage(), "scheduler");
+    try testing.expectEqual(null, zilua.Scheduler.of(lua));
+}
+
 test "Scheduler: tasks wait for std.Io jobs" {
     const io = testing.io;
     const lua = try open();

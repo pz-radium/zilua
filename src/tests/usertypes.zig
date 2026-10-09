@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const testing = std.testing;
+const zilua = @import("../zilua.zig");
 const helpers = @import("helpers.zig");
 const open = helpers.open;
 const run = helpers.run;
@@ -119,4 +120,39 @@ test "deinit runs when Lua collects an owned value" {
     // deinit is not callable from Lua, so it cannot run twice.
     lua.setGlobal("r2", Resource{ .id = 1 });
     try testing.expectError(error.Runtime, lua.doString("r2:deinit()"));
+}
+
+test "metatables are locked and finalized values are unusable" {
+    const Resource = struct {
+        var finalized: u32 = 0;
+        id: i64,
+
+        pub const zilua_name = "Resource";
+
+        pub fn get(self: *const @This()) i64 {
+            return self.id;
+        }
+
+        pub fn deinit(self: *@This()) void {
+            _ = self;
+            finalized += 1;
+        }
+    };
+    const lua = try open();
+    defer lua.deinit();
+
+    lua.setGlobal("r", Resource{ .id = 5 });
+    try run(lua, "assert(getmetatable(r) == 'Resource' and r:get() == 5)");
+    if (zilua.lang == .luau) return; // no __gc, and no debug.getmetatable
+
+    // Trusted code can still reach the metatable through the debug library.
+    // A value finalized early is refused from then on, and finalized once.
+    try run(lua,
+        \\debug.getmetatable(r).__gc(r)
+        \\assert(not pcall(function() return r:get() end))
+    );
+    try testing.expectEqual(1, Resource.finalized);
+    try run(lua, "r = nil");
+    lua.collectGarbage();
+    try testing.expectEqual(1, Resource.finalized);
 }
