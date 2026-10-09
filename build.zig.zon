@@ -1,6 +1,6 @@
 .{
     .name = .zilua,
-    .version = "0.1.0",
+    .version = "0.2.0",
     .fingerprint = 0x1a5e59c323a990b3,
     .minimum_zig_version = "0.17.0",
     // One lazy dependency per runtime: only the one selected with -Dlang is

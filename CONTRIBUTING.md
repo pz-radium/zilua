@@ -10,6 +10,8 @@
   real `lua5.4`, and `zig fmt --check`. A pull request merges once it passes.
 - Keep commits focused, with a short imperative subject line
   ("Add Table.len for Luau", not "added stuff").
+- Note changes users will notice under "Unreleased" in
+  [CHANGELOG.md](CHANGELOG.md).
 
 ## Before pushing
 
