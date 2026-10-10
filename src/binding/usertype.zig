@@ -129,6 +129,34 @@ fn hasHandleFields(comptime T: type) bool {
     return false;
 }
 
+/// Whether a bitwise copy of a `T` read from Lua would share something a
+/// finalizer releases (memory freed by `deinit`/`__gc`, handles), so that
+/// assigning one to a field would give it two owners.
+fn copyShares(comptime T: type) bool {
+    switch (@typeInfo(T)) {
+        .optional => |o| return copyShares(o.child),
+        .array => |a| return copyShares(a.child),
+        .@"union" => |u| {
+            for (u.field_types) |FT| {
+                if (copyShares(FT)) return true;
+            }
+            return false;
+        },
+        .@"struct" => |s| {
+            if (convert.isUsertype(T)) {
+                if (finalizer(T) != .none) return true;
+            } else if (!s.is_tuple) {
+                return false;
+            }
+            for (s.field_types) |FT| {
+                if (copyShares(FT)) return true;
+            }
+            return false;
+        },
+        else => return false,
+    }
+}
+
 /// Whether Lua can own (and later finalize) values of `T`.
 pub fn canOwn(comptime T: type) bool {
     return finalizer(T) != .unsupported;
@@ -445,7 +473,7 @@ fn newIndexFn(comptime T: type) api.CFunction {
             const info = @typeInfo(T).@"struct";
             inline for (info.field_names, info.field_types, info.field_attrs) |name, FT, attrs| {
                 if (std.mem.eql(u8, key, name)) {
-                    if (comptime attrs.@"comptime" or convert.isBorrowed(FT) or !convert.canRead(FT)) {
+                    if (comptime attrs.@"comptime" or convert.isBorrowed(FT) or !convert.canRead(FT) or copyShares(FT)) {
                         return api.raiseF(L, "field '%s' of %s cannot be set from Lua", name.ptr, name_z);
                     } else {
                         const value = convert.to(FT, L, 3) catch {

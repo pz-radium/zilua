@@ -122,6 +122,31 @@ test "deinit runs when Lua collects an owned value" {
     try testing.expectError(error.Runtime, lua.doString("r2:deinit()"));
 }
 
+test "fields whose copies would share finalized resources cannot be assigned" {
+    const Owner = struct {
+        id: i64,
+
+        pub fn deinit(self: *@This()) void {
+            _ = self;
+        }
+    };
+    const Holder = struct { owner: Owner, plain: Vec2 };
+    const lua = try open();
+    defer lua.deinit();
+
+    var holder: Holder = .{ .owner = .{ .id = 1 }, .plain = .{ .x = 0, .y = 0 } };
+    lua.setGlobal("holder", &holder);
+    lua.setGlobal("other", Owner{ .id = 2 });
+    lua.setGlobal("v", Vec2{ .x = 3, .y = 4 });
+    // A copy of `other` would be deinit'ed twice: refused.
+    try testing.expectError(error.Runtime, lua.doString("holder.owner = other"));
+    try expectContains(lua.errorMessage(), "cannot be set from Lua");
+    try testing.expectEqual(1, holder.owner.id);
+    // Plain values still copy.
+    try run(lua, "holder.plain = v");
+    try testing.expectEqual(3, holder.plain.x);
+}
+
 test "invalidate detaches Lua from a Zig object" {
     const Inner = struct { v: i64 };
     const Outer = struct {

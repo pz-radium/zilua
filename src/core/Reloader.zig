@@ -52,11 +52,14 @@ pub fn deinit(self: *Reloader) void {
 /// Runs the file at `path` and watches it. The file stays watched even if
 /// this first run fails, so that fixing it reloads it.
 pub fn watch(self: *Reloader, io: std.Io, path: []const u8) Error!void {
-    const owned = try self.gpa.dupe(u8, path);
-    errdefer self.gpa.free(owned);
-    const chunkname = try std.mem.concatWithSentinel(self.gpa, u8, &.{ "@", path }, 0);
-    errdefer self.gpa.free(chunkname);
-    try self.files.append(self.gpa, .{ .path = owned, .chunkname = chunkname, .mtime = 0, .size = 0 });
+    {
+        const owned = try self.gpa.dupe(u8, path);
+        errdefer self.gpa.free(owned);
+        const chunkname = try std.mem.concatWithSentinel(self.gpa, u8, &.{ "@", path }, 0);
+        errdefer self.gpa.free(chunkname);
+        try self.files.append(self.gpa, .{ .path = owned, .chunkname = chunkname, .mtime = 0, .size = 0 });
+    }
+    // The list owns both strings now, even if this first run fails.
     try self.load(io, self.files.items.len - 1);
 }
 

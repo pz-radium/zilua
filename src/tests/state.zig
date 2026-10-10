@@ -68,6 +68,53 @@ test "doFile skips a shebang line and refuses precompiled chunks" {
     try expectContains(lua.errorMessage(), "mode");
 }
 
+test "doFile fails cleanly under a memory limit" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // A 1 MiB string constant: loading it needs more than the limit allows.
+    const big = try testing.allocator.alloc(u8, 1 << 20);
+    defer testing.allocator.free(big);
+    @memset(big, 'x');
+    const source = try std.mem.concat(testing.allocator, u8, &.{ "s = \"", big, "\"" });
+    defer testing.allocator.free(source);
+    try tmp.dir.writeFile(io, .{ .sub_path = "big.lua", .data = source });
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buf, ".zig-cache/tmp/{s}/big.lua", .{&tmp.sub_path}, 0);
+
+    const lua = try open();
+    defer lua.deinit();
+    lua.setMemoryLimit(lua.memoryUsed() + (256 << 10));
+    if (lua.doFile(path)) |_| return error.TestUnexpectedResult else |_| {}
+    lua.setMemoryLimit(null);
+    try run(lua, "x = 1");
+}
+
+test "the State API ignores metamethods of the globals table" {
+    const lua = try open();
+    defer lua.deinit();
+    // A "strict" module: reading or creating undeclared globals raises.
+    try run(lua,
+        \\setmetatable(_G, {
+        \\  __index = function(_, k) error("undefined global " .. k) end,
+        \\  __newindex = function(_, k) error("undeclared global " .. k) end,
+        \\})
+    );
+    try testing.expectEqual(null, try lua.getGlobal(?i64, "missing"));
+    try testing.expectError(error.Runtime, lua.call(void, "missing", .{}));
+    lua.setGlobal("created", @as(i64, 7));
+    try testing.expectEqual(7, try lua.getGlobal(i64, "created"));
+}
+
+test "collectGarbage survives a failing finalizer" {
+    const lua = try open();
+    defer lua.deinit();
+    // Lua 5.2 and 5.3 re-throw errors in __gc from a full collection.
+    try run(lua, "setmetatable({}, { __gc = function() error('in __gc') end })");
+    lua.collectGarbage();
+    try run(lua, "x = 1");
+}
+
 test "runtime errors carry a traceback on every runtime" {
     const lua = try open();
     defer lua.deinit();

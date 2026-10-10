@@ -402,8 +402,11 @@ pub fn to(comptime T: type, L: *lua_State, idx: c_int) Error!T {
                 return @ptrCast(@alignCast(header.ptr));
             }
             if (p.child == anyopaque) {
+                // Light userdata only: a full userdata belongs to whoever
+                // created it (a zilua usertype, another library), and is not
+                // the host's to interpret.
                 return switch (api.typeOf(L, idx)) {
-                    .light_userdata, .userdata => api.toUserdata(L, idx).?,
+                    .light_userdata => api.toUserdata(L, idx).?,
                     else => error.TypeMismatch,
                 };
             }

@@ -15,6 +15,11 @@ const geometry = struct {
         _ = lua.allocator();
         return "1.0";
     }
+
+    /// Takes a handle, which lives on the context's main thread.
+    pub fn count(t: zilua.Table) usize {
+        return t.len();
+    }
 };
 
 comptime {
@@ -46,6 +51,19 @@ test "a module works in a state zilua did not create" {
     api.call(L, 0, 1);
     api.setGlobal(L, "geometry");
     try expectRuns(L, "assert(geometry.area(2, 3) == 6 and geometry.version() == '1.0')");
+
+    // A second state, where zilua first attaches from inside a coroutine
+    // (on 5.1 and LuaJIT the context then runs on that coroutine), which is
+    // collected before the next call.
+    const L2 = api.newDefaultState() orelse return error.OutOfMemory;
+    defer api.close(L2);
+    api.openLibs(L2);
+    api.pushCFunction(L2, luaopen_zilua_test_geometry);
+    api.call(L2, 0, 1);
+    api.setGlobal(L2, "geometry");
+    try expectRuns(L2, "coroutine.wrap(function() assert(geometry.count({ 1, 2 }) == 2) end)()");
+    api.gcCollect(L2);
+    try expectRuns(L2, "assert(geometry.count({ 1, 2, 3 }) == 3)");
 
     // The same open function, without the symbol.
     api.pushCFunction(L, zilua.module.openFunction(geometry));

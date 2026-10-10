@@ -13,6 +13,9 @@ const convert = @import("../binding/convert.zig");
 const State = @import("State.zig");
 const ref = @import("ref.zig");
 
+/// Most calls from Zig into Lua that may be nested, like Lua's LUAI_MAXCCALLS.
+const max_nested_calls = 200;
+
 /// What a coroutine handed back from `Thread.run`.
 pub fn RunResult(comptime R: type) type {
     return union(enum) {
@@ -111,6 +114,15 @@ pub const Thread = struct {
     /// in `run`.
     pub fn resumeRaw(self: Thread, nargs: c_int) State.Error!api.ResumeResult {
         const co = self.state.L;
+        // Lua bounds nested C calls from the count of the resuming thread,
+        // which zilua cannot name (it passes the main thread), so it bounds
+        // nested calls from Zig itself: a task that spawns tasks that spawn
+        // tasks would otherwise overflow the native stack.
+        if (self.state.ctx.depth >= max_nested_calls) {
+            api.pop(co, nargs);
+            self.state.ctx.setErrorMessage("C stack overflow");
+            return error.StackOverflow;
+        }
         self.state.enterCall();
         defer self.state.leaveCall();
         self.state.hookThread(co);

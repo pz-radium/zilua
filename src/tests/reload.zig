@@ -42,6 +42,24 @@ test "Reloader runs files again when they change" {
     try testing.expectEqual(0, try reloader.poll(io));
 }
 
+test "Reloader keeps watching a file whose first run fails" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "broken.lua", .data = "value = = 1" });
+
+    const lua = try open();
+    defer lua.deinit();
+    // testing.allocator reports a double free or leak of the watched path.
+    var reloader: zilua.Reloader = .init(lua, testing.allocator, tmp.dir);
+    defer reloader.deinit();
+
+    try testing.expectError(error.Syntax, reloader.watch(io, "broken.lua"));
+    try tmp.dir.writeFile(io, .{ .sub_path = "broken.lua", .data = "value = 5 -- fixed" });
+    try testing.expectEqual(1, try reloader.poll(io));
+    try testing.expectEqual(5, try lua.getGlobal(i64, "value"));
+}
+
 test "reloadModule swaps new code into the loaded table" {
     const lua = try open();
     defer lua.deinit();

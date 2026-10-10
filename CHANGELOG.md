@@ -5,6 +5,26 @@ before 1.0, a minor version may break the API.
 
 ## Unreleased
 
+### Fixed
+
+- `Reloader.watch` freed the path of a file whose first run failed while
+  still watching it.
+- `doFile` on Lua 5.1 and Luau could raise outside protected mode (and leak
+  the open file) when out of memory; it now reads the file in one pass.
+- The State API reads and writes globals raw, so a `__index`/`__newindex` on
+  the globals table (a "strict" module) no longer runs outside protected mode.
+- Coroutines resumed from Zig inside each other (tasks spawning tasks) are
+  bounded at 200 levels with "C stack overflow" instead of overflowing the
+  native stack.
+- A Lua C module first called from a coroutine on Lua 5.1 or LuaJIT keeps
+  that coroutine alive, since its context runs on it.
+- Assigning a usertype field whose copy would share what a finalizer
+  releases (`deinit` memory, handles) is refused.
+- `collectGarbage` no longer aborts when a `__gc` metamethod raises (5.2, 5.3).
+- Scheduler jobs keep the `std.Io` they started on, reserve stack space for
+  their results, and a task waiting NaN seconds is reported.
+- `*anyopaque` parameters take light userdata only.
+
 ## 0.2.0 - 2026-10-09
 
 ### Security

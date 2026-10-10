@@ -614,23 +614,23 @@ pub fn rawSetP(L: *lua_State, idx: c_int, p: *const anyopaque) void {
     }
 }
 
+/// Pushes global `name`. Raw: an `__index` on the globals table (a "strict"
+/// module, say) would otherwise run, and could raise, outside protected mode.
 pub fn getGlobal(L: *lua_State, name: [*:0]const u8) Type {
-    switch (lang) {
-        .lua51, .luajit, .luau => return getField(L, c.LUA_GLOBALSINDEX, name),
-        .lua52 => {
-            c.lua_getglobal(L, name);
-            return typeOf(L, -1);
-        },
-        else => return @fromBackingInt(c.lua_getglobal(L, name)),
-    }
+    pushGlobalTable(L);
+    pushString(L, std.mem.span(name));
+    const ty = rawGet(L, -2);
+    remove(L, -2);
+    return ty;
 }
 
-/// Pops a value and stores it as global `name`.
+/// Pops a value and stores it as global `name`. Raw, like `getGlobal`.
 pub fn setGlobal(L: *lua_State, name: [*:0]const u8) void {
-    switch (lang) {
-        .lua51, .luajit, .luau => c.lua_setfield(L, c.LUA_GLOBALSINDEX, name),
-        else => c.lua_setglobal(L, name),
-    }
+    pushGlobalTable(L);
+    pushString(L, std.mem.span(name));
+    pushValue(L, -3);
+    rawSet(L, -3);
+    pop(L, 2);
 }
 
 /// Pushes `t[k]` for the next key after the one on top. Returns false at the end.
@@ -790,7 +790,10 @@ pub fn loadBuffer(L: *lua_State, buf: []const u8, chunkname: [*:0]const u8, mode
             // bytecode has no signature, so `.any` is treated as source.
             if (mode == .binary) return luauLoad(L, chunkname, buf);
             var size: usize = 0;
-            const bytecode = luau.luau_compile(buf.ptr, buf.len, null, &size) orelse return .memory;
+            const bytecode = luau.luau_compile(buf.ptr, buf.len, null, &size) orelse {
+                _ = pushFString(L, "not enough memory");
+                return .memory;
+            };
             // luau_load runs in protected mode, so this defer cannot be skipped.
             defer std.c.free(bytecode);
             return luauLoad(L, chunkname, bytecode[0..size]);
@@ -808,36 +811,55 @@ pub fn loadFile(L: *lua_State, path: [*:0]const u8, mode: LoadMode) Status {
     switch (lang) {
         .lua51, .luau => {
             // Luau has no luaL_loadfile, and 5.1's takes no mode, so it would
-            // load a binary chunk. Read the file into a Lua string with C
-            // stdio and load it like a buffer, which checks the mode.
-            const file = std.c.fopen(path, "rb") orelse {
-                _ = pushFString(L, "cannot open %s", path);
-                return .file;
+            // load a binary chunk. Read the file with C stdio into C memory
+            // and load it like a buffer, which checks the mode. No Lua call
+            // that can raise runs while the file or that memory is held.
+            const gpa = std.heap.c_allocator;
+            const source = readFileC(gpa, path) catch |err| switch (err) {
+                error.OutOfMemory => {
+                    _ = pushFString(L, "not enough memory");
+                    return .memory;
+                },
+                error.CannotOpen => {
+                    _ = pushFString(L, "cannot open %s", path);
+                    return .file;
+                },
             };
-            defer _ = std.c.fclose(file);
-            _ = pushFString(L, "@%s", path);
-            pushString(L, "");
-            var chunk: [4096]u8 = undefined;
-            while (true) {
-                const n = std.c.fread(&chunk, 1, chunk.len, file);
-                if (n == 0) break;
-                pushString(L, chunk[0..n]);
-                concat(L, 2);
-            }
+            const chunkname = std.mem.concatWithSentinel(gpa, u8, &.{ "@", std.mem.span(path) }, 0) catch {
+                gpa.free(source);
+                _ = pushFString(L, "not enough memory");
+                return .memory;
+            };
             // Like luaL_loadfile, skip a first line starting with '#' (a
             // shebang), keeping its newline so line numbers stay right.
-            var source = toLString(L, -1).?;
-            if (source.len > 0 and source[0] == '#') {
-                source = source[std.mem.indexOfScalar(u8, source, '\n') orelse source.len ..];
+            var text: []const u8 = source;
+            if (text.len > 0 and text[0] == '#') {
+                text = text[std.mem.indexOfScalar(u8, text, '\n') orelse text.len ..];
             }
-            const status = loadBuffer(L, source, toCString(L, -2).?, mode);
-            // Drop the chunk name and the source below the result.
-            remove(L, -2);
-            remove(L, -2);
+            // Loading runs in protected mode and never raises.
+            const status = loadBuffer(L, text, chunkname.ptr, mode);
+            gpa.free(chunkname);
+            gpa.free(source);
             return status;
         },
         else => return toStatus(c.luaL_loadfilex(L, path, mode.cString())),
     }
+}
+
+/// Reads the whole file at `path` with C stdio into memory from `gpa`.
+fn readFileC(gpa: std.mem.Allocator, path: [*:0]const u8) error{ OutOfMemory, CannotOpen }![]u8 {
+    const file = std.c.fopen(path, "rb") orelse return error.CannotOpen;
+    defer _ = std.c.fclose(file);
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    while (true) {
+        try buf.ensureUnusedCapacity(gpa, 4096);
+        const free_space = buf.unusedCapacitySlice();
+        const n = std.c.fread(free_space.ptr, 1, free_space.len, file);
+        if (n == 0) break;
+        buf.items.len += n;
+    }
+    return buf.toOwnedSlice(gpa);
 }
 
 /// Raises the value on top of the stack as an error. Never returns.
@@ -1079,9 +1101,6 @@ pub fn setStepHook(L: *lua_State, f: ?StepFn) void {
     }
 }
 
-/// Makes the step hook of thread `L` fire every `interval` instructions
-/// instead of `step_instructions`. Luau's interrupt already fires at every
-/// safepoint, so there it does nothing.
 /// Gives coroutine `co` the step hook set with `setStepHook`. PUC Lua hooks
 /// belong to each thread (a coroutine copies its creator's when created);
 /// LuaJIT's and Luau's are global, so there is nothing to do there.
@@ -1092,6 +1111,9 @@ pub fn hookThread(co: *lua_State) void {
     }
 }
 
+/// Makes the step hook of thread `L` fire every `interval` instructions
+/// instead of `step_instructions`. Luau's interrupt already fires at every
+/// safepoint, so there it does nothing.
 pub fn setStepInterval(L: *lua_State, interval: c_int) void {
     if (lang == .luau) return;
     c.lua_sethook(L, &countHook, c.LUA_MASKCOUNT, interval);
@@ -1140,8 +1162,16 @@ pub fn allocUserdata(L: *lua_State) ?*anyopaque {
 // ---------------------------------------------------------------------------
 // Garbage collector
 
+/// Runs a full collection. Protected: on 5.2 and 5.3 an error in a `__gc`
+/// metamethod is re-thrown by the collection; it is dropped here.
 pub fn gcCollect(L: *lua_State) void {
-    _ = c.lua_gc(L, c.LUA_GCCOLLECT, @as(c_int, 0));
+    pushCFunction(L, gcCollectFn);
+    if (pcall(L, 0, 0, 0) != .ok) pop(L, 1);
+}
+
+fn gcCollectFn(L: ?*lua_State) callconv(.c) c_int {
+    _ = c.lua_gc(L.?, c.LUA_GCCOLLECT, @as(c_int, 0));
+    return 0;
 }
 
 /// Bytes currently allocated by the state.

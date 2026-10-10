@@ -81,6 +81,25 @@ test "tagged unions are one-entry tables" {
     try expectContains(lua.errorMessage(), "invalid enum value");
 }
 
+test "*anyopaque parameters take light userdata only" {
+    const Opaque = struct {
+        fn check(p: *anyopaque) bool {
+            _ = p;
+            return true;
+        }
+    };
+    const Box = struct { n: i64 };
+    const lua = try open();
+    defer lua.deinit();
+
+    var x: u8 = 0;
+    lua.setGlobal("check", Opaque.check);
+    lua.setGlobal("handle", @as(*anyopaque, &x));
+    lua.setGlobal("box", Box{ .n = 1 });
+    try run(lua, "assert(check(handle))");
+    try testing.expectError(error.Runtime, lua.doString("check(box)"));
+}
+
 test "zilua.Args takes any number of arguments" {
     const lua = try open();
     defer lua.deinit();

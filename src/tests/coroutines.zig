@@ -163,6 +163,24 @@ const jobs = struct {
         return zilua.yield(try scheduler.startJob(slowDouble, .{ testing.io, x }));
     }
 
+    const Forty = blk: {
+        var types: [40]type = undefined;
+        for (&types) |*t| t.* = i64;
+        const final = types;
+        break :blk @Tuple(&final);
+    };
+
+    fn forty() Forty {
+        var result: Forty = undefined;
+        inline for (0..40) |i| result[i] = i;
+        return result;
+    }
+
+    fn many(lua: zilua.State) !zilua.Yield(zilua.Scheduler.Job) {
+        const scheduler = zilua.Scheduler.of(lua) orelse return lua.fail("no scheduler");
+        return zilua.yield(try scheduler.startJob(forty, .{}));
+    }
+
     fn computeFailing(lua: zilua.State) !zilua.Yield(zilua.Scheduler.Job) {
         const scheduler = zilua.Scheduler.of(lua) orelse return lua.fail("no scheduler");
         return zilua.yield(try scheduler.startJob(failing, .{}));
@@ -242,6 +260,65 @@ test "Scheduler: tasks run under the limits they are given or inherit" {
     try testing.expectEqual(2, Errors.instructions);
     try testing.expectEqual(1, Errors.memory);
     try testing.expectEqual(500500, try sandbox.get(i64, "done"));
+}
+
+test "Scheduler: runaway nesting and bad waits are reported, not fatal" {
+    const Errors = struct {
+        var overflow: u32 = 0;
+        var bad_wait: u32 = 0;
+
+        fn onError(state: zilua.State, message: []const u8) void {
+            _ = state;
+            if (helpers.contains(message, "C stack overflow")) overflow += 1;
+            if (helpers.contains(message, "seconds to wait")) bad_wait += 1;
+        }
+    };
+    const lua = try open();
+    defer lua.deinit();
+    var scheduler: zilua.Scheduler = .init(lua, testing.allocator);
+    defer scheduler.deinit();
+    scheduler.on_error = Errors.onError;
+    scheduler.registerWait("wait");
+    scheduler.registerSpawn("spawn");
+
+    // Each task spawns the next, which runs right away inside it.
+    try run(lua, "function nest() spawn(nest) end");
+    const nest = try lua.getGlobal(zilua.Function, "nest");
+    defer nest.deinit();
+    try scheduler.spawn(nest, .{});
+    try testing.expectEqual(1, Errors.overflow);
+
+    // NaN seconds would never be due.
+    try run(lua, "function nan() wait(0 / 0) end");
+    const nan = try lua.getGlobal(zilua.Function, "nan");
+    defer nan.deinit();
+    try scheduler.spawn(nan, .{});
+    try testing.expectEqual(1, Errors.bad_wait);
+    try testing.expectEqual(0, scheduler.count());
+}
+
+test "Scheduler: jobs keep their std.Io and room for many results" {
+    const io = testing.io;
+    const lua = try open();
+    defer lua.deinit();
+    var scheduler: zilua.Scheduler = .init(lua, testing.allocator);
+    defer scheduler.deinit();
+    scheduler.io = io;
+    scheduler.attach();
+    lua.setGlobal("many", jobs.many);
+
+    try run(lua, "function task() count = select('#', many()) end");
+    const task = try lua.getGlobal(zilua.Function, "task");
+    defer task.deinit();
+    try scheduler.spawn(task, .{});
+    // The job finishes on the std.Io it started with.
+    scheduler.io = null;
+    var spins: usize = 0;
+    while (scheduler.count() > 0 and spins < 5000) : (spins += 1) {
+        scheduler.update(0);
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try testing.expectEqual(40, try lua.getGlobal(i64, "count"));
 }
 
 test "Scheduler: only one task can wait for a job" {

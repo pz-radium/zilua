@@ -80,7 +80,7 @@ pub fn deinit(self: *Scheduler) void {
     for (self.tasks.items) |task| task.thread.deinit();
     self.tasks.deinit(self.gpa);
     for (self.jobs.items) |job| {
-        if (self.io) |io| job.cancel(job, io);
+        job.cancel(job);
         job.destroy(job, self.gpa);
     }
     self.jobs.deinit(self.gpa);
@@ -141,7 +141,7 @@ pub fn update(self: *Scheduler, now: f64) void {
                     i += 1;
                     continue;
                 }
-                const n = job.finish(job, self.io.?, co);
+                const n = job.finish(job, co);
                 self.forgetJob(job);
                 break :blk n;
             },
@@ -176,7 +176,11 @@ fn step(self: *Scheduler, t: thread.Thread, nargs: c_int, limits: ?Sandbox.Limit
     const first = -result.nresults;
     switch (api.typeOf(co, first)) {
         .nil => return .{ .at = self.now },
-        .number => return .{ .at = self.now + api.toNumber(co, first).? },
+        .number => {
+            // NaN would never compare as due: report it instead.
+            const seconds = api.toNumber(co, first).?;
+            if (!std.math.isNan(seconds)) return .{ .at = self.now + seconds };
+        },
         .light_userdata => {
             const ptr = api.toUserdata(co, first);
             for (self.jobs.items) |job| {
@@ -280,9 +284,11 @@ const JobHeader = struct {
     done: std.atomic.Value(bool) = .init(false),
     /// A task waits for this job (see `step`).
     claimed: bool = false,
+    /// The `std.Io` the work runs on, kept even if `Scheduler.io` changes.
+    io: std.Io,
     /// Awaits the work and pushes its result onto `L`; returns how many values.
-    finish: *const fn (header: *JobHeader, io: std.Io, L: *api.lua_State) c_int,
-    cancel: *const fn (header: *JobHeader, io: std.Io) void,
+    finish: *const fn (header: *JobHeader, L: *api.lua_State) c_int,
+    cancel: *const fn (header: *JobHeader) void,
     destroy: *const fn (header: *JobHeader, gpa: std.mem.Allocator) void,
 };
 
@@ -308,7 +314,7 @@ pub fn startJob(self: *Scheduler, comptime function: anytype, args: std.meta.Arg
     const impl = try self.gpa.create(Impl);
     errdefer self.gpa.destroy(impl);
     impl.* = .{
-        .header = .{ .finish = Impl.finish, .cancel = Impl.cancel, .destroy = Impl.destroy },
+        .header = .{ .io = io, .finish = Impl.finish, .cancel = Impl.cancel, .destroy = Impl.destroy },
         .args = args,
     };
     try self.jobs.append(self.gpa, &impl.header);
@@ -342,11 +348,12 @@ fn JobImpl(comptime function: anytype) type {
             self.header.done.store(true, .release);
         }
 
-        fn finish(header: *JobHeader, io: std.Io, L: *api.lua_State) c_int {
+        fn finish(header: *JobHeader, L: *api.lua_State) c_int {
             const self: *Self = @alignCast(@fieldParentPtr("header", header));
-            self.future.await(io);
+            self.future.await(header.io);
             if (@typeInfo(Result) == .error_union) {
                 const value = self.result catch |err| {
+                    if (!api.checkStack(L, 2)) return 0;
                     api.pushNil(L);
                     api.pushString(L, @errorName(err));
                     return 2;
@@ -356,19 +363,26 @@ fn JobImpl(comptime function: anytype) type {
             return pushValue(L, self.result);
         }
 
+        /// Pushes the result onto the task's stack, which only has Lua's
+        /// minimum of free slots. Without room the task gets no values.
         fn pushValue(L: *api.lua_State, value: anytype) c_int {
             const V = @TypeOf(value);
             if (comptime @typeInfo(V) == .@"struct" and @hasDecl(V, "zilua_owned")) {
+                if (!api.checkStack(L, convert.resultCount(@TypeOf(value.value)) + 2)) {
+                    convert.free(value.gpa, value.value);
+                    return 0;
+                }
                 const n = convert.pushMulti(L, value.value);
                 convert.free(value.gpa, value.value);
                 return n;
             }
+            if (!api.checkStack(L, convert.resultCount(V) + 2)) return 0;
             return convert.pushMulti(L, value);
         }
 
-        fn cancel(header: *JobHeader, io: std.Io) void {
+        fn cancel(header: *JobHeader) void {
             const self: *Self = @alignCast(@fieldParentPtr("header", header));
-            self.future.cancel(io);
+            self.future.cancel(header.io);
         }
 
         fn destroy(header: *JobHeader, gpa: std.mem.Allocator) void {

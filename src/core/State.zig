@@ -74,7 +74,7 @@ pub const Context = struct {
     /// allocator accounting, so no memory or instruction limits.
     foreign: bool = false,
 
-    fn setErrorMessage(ctx: *Context, msg: []const u8) void {
+    pub fn setErrorMessage(ctx: *Context, msg: []const u8) void {
         ctx.err_len = 0;
         if (ctx.err_buf == null or ctx.err_buf.?.len < msg.len) {
             if (ctx.err_buf) |old| ctx.allocator.free(old);
@@ -134,11 +134,19 @@ pub fn fromLua(L: *api.lua_State) State {
 }
 
 var foreign_anchor_key: u8 = 0;
+var foreign_main_key: u8 = 0;
 
 fn attachForeign(L: *api.lua_State) *Context {
     const gpa = std.heap.c_allocator;
     const ctx = gpa.create(Context) catch @panic("zilua: out of memory");
-    ctx.* = .{ .allocator = gpa, .main = api.mainThread(L), .traceback = true, .foreign = true };
+    const main = api.mainThread(L);
+    ctx.* = .{ .allocator = gpa, .main = main, .traceback = true, .foreign = true };
+    if (main == L) {
+        // Lua 5.1 and LuaJIT cannot name the main thread, so `L` may be a
+        // coroutine: keep it alive for as long as the context uses it.
+        _ = api.pushThread(L);
+        api.rawSetP(L, api.registry_index, &foreign_main_key);
+    }
 
     // A userdata anchored in the registry frees the context when the state
     // closes (Luau calls a destructor instead of __gc).
