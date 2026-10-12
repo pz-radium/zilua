@@ -82,3 +82,27 @@ test "reloadModule swaps new code into the loaded table" {
     try lua.reloadModule("greeter");
     try run(lua, "assert(greeter.hello() == 'v2' and require('greeter') == greeter)");
 }
+
+test "Reloader refuses a watched file that grew past its limit" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "big.lua", .data = "value = 1\n" });
+
+    const lua = try open();
+    defer lua.deinit();
+    var reloader: zilua.Reloader = .init(lua, testing.allocator, tmp.dir);
+    defer reloader.deinit();
+    reloader.max_file_size = 64;
+
+    try reloader.watch(io, "big.lua");
+    try testing.expectEqual(1, try lua.getGlobal(i64, "value"));
+
+    const big = try testing.allocator.alloc(u8, 256);
+    defer testing.allocator.free(big);
+    @memset(big, ' ');
+    try tmp.dir.writeFile(io, .{ .sub_path = "big.lua", .data = big });
+    try testing.expectError(error.StreamTooLong, reloader.poll(io));
+    // The version loaded before is still in place.
+    try testing.expectEqual(1, try lua.getGlobal(i64, "value"));
+}

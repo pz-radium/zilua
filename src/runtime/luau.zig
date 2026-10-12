@@ -24,6 +24,13 @@ pub const LUA_TUSERDATA: c_int = 9;
 pub const LUA_TTHREAD: c_int = 10;
 pub const LUA_TBUFFER: c_int = 11;
 
+// enum lua_CoStatus
+pub const LUA_CORUN: c_int = 0;
+pub const LUA_COSUS: c_int = 1;
+pub const LUA_CONOR: c_int = 2;
+pub const LUA_COFIN: c_int = 3;
+pub const LUA_COERR: c_int = 4;
+
 pub const Continuation = *const fn (L: ?*lua_State, status: c_int) callconv(.c) c_int;
 pub const Destructor = *const fn (L: ?*lua_State, userdata: ?*anyopaque) callconv(.c) void;
 pub const PanicFn = *const fn (L: ?*lua_State, errcode: c_int) callconv(.c) void;
@@ -42,6 +49,8 @@ pub const Callbacks = extern struct {
 
 pub extern fn lua_callbacks(L: *lua_State) *Callbacks;
 pub extern fn lua_mainthread(L: *lua_State) *lua_State;
+/// `lua_CoStatus` of `co`, which `L` must be able to see (the main thread).
+pub extern fn lua_costatus(L: *lua_State, co: *lua_State) c_int;
 pub extern fn lua_setreadonly(L: *lua_State, idx: c_int, enabled: c_int) void;
 pub extern fn lua_getreadonly(L: *lua_State, idx: c_int) c_int;
 pub extern fn lua_setsafeenv(L: *lua_State, idx: c_int, enabled: c_int) void;

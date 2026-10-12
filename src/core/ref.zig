@@ -22,8 +22,24 @@ pub const Ref = struct {
         return .{ .state = main, .id = api.ref(state.L, api.registry_index) };
     }
 
+    /// Releases the reference. Exactly once: Lua hands a released id out
+    /// again, so releasing twice would give two handles one slot. Handles
+    /// are copied by value, so `clone` before handing one on.
     pub fn deinit(self: Ref) void {
         api.unref(self.state.L, api.registry_index, self.id);
+    }
+
+    /// `deinit` for a handle that knows what it references, which catches
+    /// the common mistake of releasing one twice (in safe builds: a
+    /// released id refers to the free list instead of a value).
+    pub fn deinitExpecting(self: Ref, expected: api.Type) void {
+        if (std.debug.runtime_safety) {
+            self.push(self.state.L);
+            const found = api.typeOf(self.state.L, -1);
+            api.pop(self.state.L, 1);
+            if (found != expected) @panic("zilua: handle released twice, or after its state was closed");
+        }
+        self.deinit();
     }
 
     /// Pushes the referenced value onto `L`, which must belong to the same state.
@@ -39,17 +55,21 @@ pub const Ref = struct {
 
     /// Reads the value as a `T` that owns its memory (see `State.getGlobalAlloc`).
     pub fn getAlloc(self: Ref, gpa: std.mem.Allocator, comptime T: type) State.Error!T {
-        self.push(self.state.L);
-        defer api.pop(self.state.L, 1);
-        return convert.toAlloc(T, gpa, self.state.L, -1);
+        return self.read(gpa, T);
     }
 
     /// Reads the value as a `T`.
     pub fn get(self: Ref, comptime T: type) State.Error!T {
         comptime convert.ensureOwned(T, "Ref.get");
+        return self.read(null, T);
+    }
+
+    fn read(self: Ref, gpa: ?std.mem.Allocator, comptime T: type) State.Error!T {
+        const work = self.state.beginHostWork();
+        defer work.end();
         self.push(self.state.L);
         defer api.pop(self.state.L, 1);
-        return convert.to(T, self.state.L, -1);
+        return convert.readAt(T, gpa, self.state.L, -1, 0);
     }
 };
 
@@ -63,7 +83,7 @@ pub const Table = struct {
     }
 
     pub fn deinit(self: Table) void {
-        self.ref.deinit();
+        self.ref.deinitExpecting(.table);
     }
 
     pub fn push(self: Table, L: *api.lua_State) void {
@@ -74,22 +94,23 @@ pub const Table = struct {
     /// or an integer.
     pub fn get(self: Table, comptime T: type, key: anytype) State.Error!T {
         comptime convert.ensureOwned(T, "Table.get");
-        const L = self.ref.state.L;
-        self.push(L);
-        convert.push(L, key);
-        _ = api.rawGet(L, -2);
-        defer api.pop(L, 2);
-        return convert.to(T, L, -1);
+        return self.read(null, T, key);
     }
 
     /// `t[key]` as a `T` that owns its memory (see `State.getGlobalAlloc`).
     pub fn getAlloc(self: Table, gpa: std.mem.Allocator, comptime T: type, key: anytype) State.Error!T {
+        return self.read(gpa, T, key);
+    }
+
+    fn read(self: Table, gpa: ?std.mem.Allocator, comptime T: type, key: anytype) State.Error!T {
+        const work = self.ref.state.beginHostWork();
+        defer work.end();
         const L = self.ref.state.L;
         self.push(L);
         convert.push(L, key);
         _ = api.rawGet(L, -2);
         defer api.pop(L, 2);
-        return convert.toAlloc(T, gpa, L, -1);
+        return convert.readAt(T, gpa, L, -1, 0);
     }
 
     /// A second, independent reference to the same table.
@@ -100,6 +121,8 @@ pub const Table = struct {
     /// `t[key] = value`. Lua tables cannot have nil or NaN keys, and Luau
     /// tables can be read-only.
     pub fn set(self: Table, key: anytype, value: anytype) error{ InvalidKey, ReadOnly }!void {
+        const work = self.ref.state.beginHostWork();
+        defer work.end();
         const L = self.ref.state.L;
         self.push(L);
         if (api.isReadonly(L, -1)) {
@@ -139,7 +162,7 @@ pub const Function = struct {
     }
 
     pub fn deinit(self: Function) void {
-        self.ref.deinit();
+        self.ref.deinitExpecting(.function);
     }
 
     pub fn push(self: Function, L: *api.lua_State) void {
@@ -154,9 +177,7 @@ pub const Function = struct {
     /// Like `call`, with results read by `toAlloc` (see `State.callAlloc`).
     pub fn callAlloc(self: Function, gpa: std.mem.Allocator, comptime R: type, args: anytype) State.Error!R {
         const state = self.ref.state;
-        try state.reserveCall(@TypeOf(args), R);
-        self.push(state.L);
-        const nargs = convert.pushMulti(state.L, args);
+        const nargs = try state.prepareCall(R, args, self);
         return state.callStackAlloc(gpa, R, nargs);
     }
 
@@ -164,9 +185,7 @@ pub const Function = struct {
     /// `args` and converts the results to `R` (see `State.call`).
     pub fn call(self: Function, comptime R: type, args: anytype) State.Error!R {
         const state = self.ref.state;
-        try state.reserveCall(@TypeOf(args), R);
-        self.push(state.L);
-        const nargs = convert.pushMulti(state.L, args);
+        const nargs = try state.prepareCall(R, args, self);
         return state.callStack(R, nargs);
     }
 };

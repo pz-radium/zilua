@@ -27,7 +27,15 @@ pub const Error = error{
     /// A usertype value that no longer exists: a reference whose Zig object
     /// was detached (`State.invalidate`), or a finalized value.
     Dead,
+    /// A table nested deeper than `max_depth`, which reading a table that
+    /// refers to itself into a self-referential type would do without end.
+    TooDeep,
 };
+
+/// How deeply tables may nest while being read into a Zig value. Only a type
+/// that refers to itself (`struct { children: []@This() }`) can reach this;
+/// for every other type the nesting is fixed by the type.
+pub const max_depth = 64;
 
 /// Errors of the conversions that allocate (`toAlloc`).
 pub const AllocError = Error || error{OutOfMemory};
@@ -53,11 +61,6 @@ pub fn asTable(value: anytype) AsTable(@TypeOf(value)) {
 /// zilua handle types that wrap a registry reference.
 pub fn isRefType(comptime T: type) bool {
     return T == ref.Ref or T == ref.Table or T == ref.Function or T == thread.Thread;
-}
-
-/// A handle or an optional handle.
-pub fn isHandleLike(comptime T: type) bool {
-    return isRefType(T) or (@typeInfo(T) == .optional and isRefType(@typeInfo(T).optional.child));
 }
 
 /// zilua's own marker types (AsTable, Yield, CallThen, Args, Job, ...).
@@ -107,6 +110,13 @@ pub fn isUsertype(comptime T: type) bool {
 /// Whether a value of this type would point into memory owned by Lua when
 /// read from the stack, and so must not outlive the stack slot it came from.
 pub fn isBorrowed(comptime T: type) bool {
+    if (isUsertype(T)) {
+        // A copy of a value Lua owns shares whatever its finalizer releases
+        // (memory freed by `deinit`, handles), so it stops being valid once
+        // Lua collects the original. That is fine for the duration of a
+        // bound call, but not for something the host keeps.
+        return usertype.isValid(T) and usertype.copyShares(T);
+    }
     return switch (@typeInfo(T)) {
         .pointer => |p| !(p.size == .one and @typeInfo(p.child) == .@"fn"),
         .optional => |o| isBorrowed(o.child),
@@ -174,7 +184,9 @@ pub fn canRead(comptime T: type) bool {
         .pointer => |p| p.size == .one and ((isUsertype(p.child) and usertype.isValid(p.child)) or p.child == anyopaque),
         .array => |a| canRead(a.child) and !isBorrowed(a.child),
         .@"struct" => |s| s.is_tuple and !anyBorrowed(s.field_types) and allCanRead(s.field_types),
-        .@"union" => |u| u.tag_type != null and allCanRead(u.field_types),
+        // As for tuples: a payload pointing into the value `lua_next` left
+        // on the stack would not survive being popped.
+        .@"union" => |u| u.tag_type != null and !anyBorrowed(u.field_types) and allCanRead(u.field_types),
         else => false,
     };
 }
@@ -265,6 +277,10 @@ pub fn push(L: *lua_State, value: anytype) void {
     }
 }
 
+/// An integer too large for the runtime's integer type goes as a number,
+/// which rounds it: Lua 5.1, 5.2, LuaJIT and Luau have no integers at all,
+/// so they keep 53 bits exactly, and `u64` values above `i64`'s range round
+/// on every runtime. Pass larger values as strings.
 fn pushInt(L: *lua_State, value: anytype) void {
     if (std.math.cast(api.Integer, value)) |i| {
         api.pushInteger(L, i);
@@ -365,15 +381,19 @@ pub fn pushMulti(L: *lua_State, values: anytype) c_int {
 // ---------------------------------------------------------------------------
 // Lua -> Zig
 
-/// Reads the value at `idx` as a `T`. Never raises a Lua error.
+/// Reads the value at `idx` as a `T`. Raises only if it runs out of memory
+/// while taking a reference for a handle in the result.
 ///
 /// `[]const u8` and `*T` results point into Lua memory and are only valid
 /// while the value stays on the stack. Bound functions can use them freely
 /// for the duration of the call; `toAlloc` copies them instead.
+///
+/// Handles in the result (`Table`, `Function`, ... anywhere inside it) are
+/// new references the caller owns: release them with `releaseHandles`.
 pub fn to(comptime T: type, L: *lua_State, idx: c_int) Error!T {
     if (comptime isString(T)) return toString(T, L, idx);
     if (comptime isRefType(T)) return toRef(T, L, idx);
-    if (comptime isUsertype(T)) return toStruct(T, L, idx);
+    if (comptime isUsertype(T)) return toStructAt(T, L, idx, 0);
 
     switch (@typeInfo(T)) {
         .void => return,
@@ -404,7 +424,10 @@ pub fn to(comptime T: type, L: *lua_State, idx: c_int) Error!T {
             if (p.child == anyopaque) {
                 // Light userdata only: a full userdata belongs to whoever
                 // created it (a zilua usertype, another library), and is not
-                // the host's to interpret.
+                // the host's to interpret. A light userdata carries no type
+                // of its own, so any pointer a script can reach fits any
+                // `*anyopaque` parameter, mutable or not: check what it
+                // points to before trusting it, or take a `*T` usertype.
                 return switch (api.typeOf(L, idx)) {
                     .light_userdata => api.toUserdata(L, idx).?,
                     else => error.TypeMismatch,
@@ -412,17 +435,18 @@ pub fn to(comptime T: type, L: *lua_State, idx: c_int) Error!T {
             }
             @compileError("zilua: cannot read " ++ @typeName(T) ++ " from Lua");
         },
-        .array => |a| return toArray(T, a.len, a.child, L, idx),
+        .array => |a| {
+            if (comptime isBorrowed(a.child)) @compileError("zilua: cannot read " ++ @typeName(T) ++ " from a table, its elements would point into Lua memory");
+            return noAlloc(readArray(T, a.len, a.child, null, L, idx, 0));
+        },
         .@"struct" => |s| {
             if (!s.is_tuple) @compileError("zilua: cannot read " ++ @typeName(T) ++ " from Lua");
-            return toTuple(T, L, idx);
+            if (comptime anyBorrowed(s.field_types)) @compileError("zilua: cannot read " ++ @typeName(T) ++ " from a table, its elements would point into Lua memory");
+            return noAlloc(readTuple(T, null, L, idx, 0));
         },
         .@"union" => |u| {
             if (u.tag_type == null) @compileError("zilua: cannot read untagged union " ++ @typeName(T));
-            return toUnion(T, null, L, idx) catch |err| switch (err) {
-                error.OutOfMemory => unreachable, // nothing allocates without gpa
-                else => |e| return e,
-            };
+            return noAlloc(toUnion(T, null, L, idx, 0));
         },
         else => @compileError("zilua: cannot read values of type " ++ @typeName(T) ++ " from Lua"),
     }
@@ -435,7 +459,14 @@ fn toString(comptime T: type, L: *lua_State, idx: c_int) Error!T {
         .string, .number => {},
         else => return error.TypeMismatch,
     }
-    const s = api.toLString(L, idx).?;
+    // Converting a number to a string allocates, so it can fail; on Luau it
+    // is not even possible for an integer value.
+    const s = api.toLString(L, idx) orelse return error.TypeMismatch;
+    if (p.sentinel_ptr != null) {
+        // The Zig value would end at the first NUL, so a string holding one
+        // would be read as something shorter than what Lua has.
+        if (std.mem.indexOfScalar(u8, s, 0) != null) return error.TypeMismatch;
+    }
     if (p.size == .slice) {
         // Lua strings are always NUL-terminated, so [:0]const u8 works too.
         return if (p.sentinel_ptr != null) s.ptr[0..s.len :0] else s;
@@ -454,7 +485,7 @@ fn toEnum(comptime E: type, L: *lua_State, idx: c_int) Error!E {
     const info = @typeInfo(E).@"enum";
     switch (api.typeOf(L, idx)) {
         .string => {
-            const s = api.toLString(L, idx).?;
+            const s = api.toLString(L, idx) orelse return error.TypeMismatch;
             inline for (info.field_names) |name| {
                 if (std.mem.eql(u8, s, name)) return @field(E, name);
             }
@@ -476,11 +507,11 @@ fn toEnum(comptime E: type, L: *lua_State, idx: c_int) Error!E {
 /// The inverse of `pushUnion`: a table with exactly one `[tag] = payload`
 /// entry, or a string naming a tag with a void payload. With `gpa`, the
 /// payload is read with `toAlloc`.
-fn toUnion(comptime U: type, gpa: ?std.mem.Allocator, L: *lua_State, idx: c_int) AllocError!U {
+fn toUnion(comptime U: type, gpa: ?std.mem.Allocator, L: *lua_State, idx: c_int, depth: u32) AllocError!U {
     const info = @typeInfo(U).@"union";
     switch (api.typeOf(L, idx)) {
         .string => {
-            const s = api.toLString(L, idx).?;
+            const s = api.toLString(L, idx) orelse return error.TypeMismatch;
             inline for (info.field_names, info.field_types) |name, FT| {
                 if (FT == void and std.mem.eql(u8, s, name)) return @unionInit(U, name, {});
             }
@@ -496,10 +527,13 @@ fn toUnion(comptime U: type, gpa: ?std.mem.Allocator, L: *lua_State, idx: c_int)
                 api.pop(L, 2);
                 return error.TypeMismatch;
             }
-            const key = api.toLString(L, -2).?;
+            const key = api.toLString(L, -2) orelse {
+                api.pop(L, 2);
+                return error.TypeMismatch;
+            };
             inline for (info.field_names, info.field_types) |name, FT| {
                 if (std.mem.eql(u8, key, name)) {
-                    const payload: FT = if (FT == void) {} else readPayload(FT, gpa, L) catch |err| {
+                    const payload: FT = if (FT == void) {} else readPayload(FT, gpa, L, depth) catch |err| {
                         api.pop(L, 2);
                         return err;
                     };
@@ -507,7 +541,7 @@ fn toUnion(comptime U: type, gpa: ?std.mem.Allocator, L: *lua_State, idx: c_int)
                     if (api.next(L, t)) {
                         // More than one entry.
                         api.pop(L, 2);
-                        if (gpa) |a| free(a, payload) else releaseHandle(payload);
+                        if (gpa) |a| free(a, payload) else releaseHandles(payload);
                         return error.TypeMismatch;
                     }
                     return @unionInit(U, name, payload);
@@ -520,21 +554,59 @@ fn toUnion(comptime U: type, gpa: ?std.mem.Allocator, L: *lua_State, idx: c_int)
     }
 }
 
-fn readPayload(comptime T: type, gpa: ?std.mem.Allocator, L: *lua_State) AllocError!T {
-    if (gpa) |a| return toAlloc(T, a, L, -1);
-    if (comptime !canRead(T)) unreachable; // canRead(U) guarantees this for `to`
-    return to(T, L, -1);
+fn readPayload(comptime T: type, gpa: ?std.mem.Allocator, L: *lua_State, depth: u32) AllocError!T {
+    return readAt(T, gpa, L, -1, depth);
+}
+
+/// Reads a `T` with `toAlloc` when there is an allocator and with `to`
+/// otherwise, which is what lets the two share their readers. Only the
+/// branch the type supports is compiled: `canReadAlloc` and `canRead` do
+/// not accept quite the same types, and the caller has checked one of them.
+pub fn readAt(comptime T: type, gpa: ?std.mem.Allocator, L: *lua_State, idx: c_int, depth: u32) AllocError!T {
+    if (comptime canReadAlloc(T)) {
+        if (gpa) |a| return toAllocAt(T, a, L, idx, depth);
+    }
+    if (comptime !canRead(T)) unreachable; // only reached for types `to` takes
+    return toNested(T, L, idx, depth);
+}
+
+/// `to` for a value nested inside another, carrying the nesting depth.
+fn toNested(comptime T: type, L: *lua_State, idx: c_int, depth: u32) Error!T {
+    if (comptime isUsertype(T)) return toStructAt(T, L, idx, depth);
+    switch (@typeInfo(T)) {
+        .optional => |o| {
+            if (api.isNoneOrNil(L, idx)) return null;
+            return try toNested(o.child, L, idx, depth);
+        },
+        .array => |a| return noAlloc(readArray(T, a.len, a.child, null, L, idx, depth)),
+        .@"struct" => |info| {
+            if (!info.is_tuple) return to(T, L, idx);
+            return noAlloc(readTuple(T, null, L, idx, depth));
+        },
+        .@"union" => return noAlloc(toUnion(T, null, L, idx, depth)),
+        else => return to(T, L, idx),
+    }
+}
+
+/// Starts one more level of nesting: room on the stack for the values it
+/// reads, and a stop before a type that refers to itself follows a table
+/// that refers to itself forever.
+fn enterNesting(L: *lua_State, depth: u32) Error!void {
+    if (depth >= max_depth) return error.TooDeep;
+    if (!api.checkStack(L, 4)) return error.TooDeep;
 }
 
 /// A usertype by value: copied out of its userdata, or built from a table
-/// when every field has a type that can be read and owned.
-///
-/// The copy shares the handles (`Table`, ...) stored in the userdata's
-/// fields: they stay owned by the Lua object. Use `toAlloc` for a deep copy.
-fn toStruct(comptime T: type, L: *lua_State, idx: c_int) Error!T {
+/// when every field has a type that can be read and owned. Handles in the
+/// copy are new references the caller owns; use `toAlloc` for a copy that
+/// owns its memory as well.
+fn toStructAt(comptime T: type, L: *lua_State, idx: c_int, depth: u32) Error!T {
     if (usertype.check(L, T, idx)) |header| {
         const ptr: *const T = @ptrCast(@alignCast(header.ptr));
-        return ptr.*;
+        // Handles are cloned, so that the copy owns them like one built from
+        // a table does: releasing it then never touches the Lua object's
+        // own references. Release with `releaseHandles`.
+        return cloneHandles(ptr.*);
     }
     if (usertype.isDead(L, T, idx)) return error.Dead;
     if (api.typeOf(L, idx) != .table) return error.TypeMismatch;
@@ -545,14 +617,20 @@ fn toStruct(comptime T: type, L: *lua_State, idx: c_int) Error!T {
     // from userdata (or `toAlloc`). So do structs with fields zilua cannot
     // read at all.
     if (comptime anyBorrowed(info.field_types) or !allCanRead(info.field_types)) return error.TypeMismatch;
-    return tableToStruct(T, null, L, idx) catch |err| switch (err) {
+    // A value with a destructor must come from a userdata: built from a
+    // table, a script would choose what gets released (a file descriptor, a
+    // texture id). Handle fields are fine, since those are references the
+    // table's own values gave out.
+    if (comptime usertype.hasDestructor(T)) return error.TypeMismatch;
+    return tableToStruct(T, null, L, idx, depth) catch |err| switch (err) {
         error.OutOfMemory => unreachable, // nothing allocates without gpa
         else => |e| return e,
     };
 }
 
-fn tableToStruct(comptime T: type, gpa: ?std.mem.Allocator, L: *lua_State, idx: c_int) AllocError!T {
+fn tableToStruct(comptime T: type, gpa: ?std.mem.Allocator, L: *lua_State, idx: c_int, depth: u32) AllocError!T {
     const info = @typeInfo(T).@"struct";
+    try enterNesting(L, depth);
     const t = api.absIndex(L, idx);
     var result: T = undefined;
     var filled: usize = 0;
@@ -573,44 +651,48 @@ fn tableToStruct(comptime T: type, gpa: ?std.mem.Allocator, L: *lua_State, idx: 
                 return error.MissingField;
             }
         } else {
-            @field(result, name) = try readPayload(FT, gpa, L);
+            @field(result, name) = try readPayload(FT, gpa, L, depth + 1);
         }
         filled = i + 1;
     }
     return result;
 }
 
-fn toArray(comptime T: type, comptime len: usize, comptime Child: type, L: *lua_State, idx: c_int) Error!T {
-    if (comptime isBorrowed(Child)) @compileError("zilua: cannot read " ++ @typeName(T) ++ " from a table, its elements would point into Lua memory");
+/// A fixed-size array from a sequence of exactly its length. With `gpa` the
+/// elements own their memory (`toAlloc`), without it they are borrowed from
+/// the stack, as everywhere else.
+fn readArray(comptime T: type, comptime len: usize, comptime Child: type, gpa: ?std.mem.Allocator, L: *lua_State, idx: c_int, depth: u32) AllocError!T {
     if (api.typeOf(L, idx) != .table) return error.TypeMismatch;
     if (api.rawLen(L, idx) != len) return error.TypeMismatch;
+    try enterNesting(L, depth);
     const t = api.absIndex(L, idx);
     var result: T = undefined;
     var filled: usize = 0;
     errdefer {
-        for (result[0..filled]) |item| releaseHandle(item);
+        for (result[0..filled]) |item| releaseItem(gpa, item);
     }
     for (&result, 1..) |*item, i| {
         _ = api.rawGetI(L, t, @intCast(i));
         defer api.pop(L, 1);
-        item.* = try to(Child, L, -1);
+        item.* = try readPayload(Child, gpa, L, depth + 1);
         filled = i;
     }
     return result;
 }
 
-fn toTuple(comptime T: type, L: *lua_State, idx: c_int) Error!T {
+/// A tuple from a sequence, one element per field. See `readArray`.
+fn readTuple(comptime T: type, gpa: ?std.mem.Allocator, L: *lua_State, idx: c_int, depth: u32) AllocError!T {
     const info = @typeInfo(T).@"struct";
-    if (comptime anyBorrowed(info.field_types)) @compileError("zilua: cannot read " ++ @typeName(T) ++ " from a table, its elements would point into Lua memory");
     if (api.typeOf(L, idx) != .table) return error.TypeMismatch;
+    try enterNesting(L, depth);
     const t = api.absIndex(L, idx);
     var result: T = undefined;
     var filled: usize = 0;
-    errdefer releaseFields(T, null, &result, filled);
+    errdefer releaseFields(T, gpa, &result, filled);
     inline for (info.field_names, info.field_types, 1..) |name, FT, i| {
         _ = api.rawGetI(L, t, i);
         defer api.pop(L, 1);
-        @field(result, name) = try to(FT, L, -1);
+        @field(result, name) = try readPayload(FT, gpa, L, depth + 1);
         filled = i;
     }
     return result;
@@ -625,27 +707,10 @@ pub fn resultCount(comptime R: type) c_int {
     };
 }
 
-/// Reads `resultCount(R)` values starting at `first` as an `R`.
-pub fn toMulti(comptime R: type, L: *lua_State, first: c_int) Error!R {
-    switch (@typeInfo(R)) {
-        .void => return,
-        .@"struct" => |s| if (s.is_tuple) {
-            var result: R = undefined;
-            var filled: usize = 0;
-            errdefer releaseFields(R, null, &result, filled);
-            inline for (s.field_names, s.field_types, 0..) |name, FT, i| {
-                @field(result, name) = try to(FT, L, first + @as(c_int, i));
-                filled = i + 1;
-            }
-            return result;
-        },
-        else => {},
-    }
-    return to(R, L, first);
-}
-
-/// Like `toMulti`, with `toAlloc`.
-pub fn toMultiAlloc(comptime R: type, gpa: std.mem.Allocator, L: *lua_State, first: c_int) AllocError!R {
+/// Reads `resultCount(R)` values starting at `first` as an `R`: one value,
+/// none for `void`, or one per field of a tuple. With `gpa` they own their
+/// memory, as in `toAlloc` (see `readAt`).
+pub fn readMulti(comptime R: type, gpa: ?std.mem.Allocator, L: *lua_State, first: c_int) AllocError!R {
     switch (@typeInfo(R)) {
         .void => return,
         .@"struct" => |s| if (s.is_tuple) {
@@ -653,14 +718,14 @@ pub fn toMultiAlloc(comptime R: type, gpa: std.mem.Allocator, L: *lua_State, fir
             var filled: usize = 0;
             errdefer releaseFields(R, gpa, &result, filled);
             inline for (s.field_names, s.field_types, 0..) |name, FT, i| {
-                @field(result, name) = try toAlloc(FT, gpa, L, first + @as(c_int, i));
+                @field(result, name) = try readAt(FT, gpa, L, first + @as(c_int, i), 0);
                 filled = i + 1;
             }
             return result;
         },
         else => {},
     }
-    return toAlloc(R, gpa, L, first);
+    return readAt(R, gpa, L, first, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -671,7 +736,9 @@ pub fn toMultiAlloc(comptime R: type, gpa: std.mem.Allocator, L: *lua_State, fir
 pub fn canReadAlloc(comptime T: type) bool {
     if (isString(T)) return @typeInfo(T).pointer.size == .slice;
     if (isRefType(T)) return true;
-    if (isUsertype(T)) return usertype.isValid(T);
+    // A deep copy duplicates memory and handles, but nothing can duplicate
+    // what a destructor releases: an owned copy would release it twice.
+    if (isUsertype(T)) return usertype.isValid(T) and !usertype.hasDestructor(T);
     return switch (@typeInfo(T)) {
         .void, .bool, .int, .float, .@"enum" => true,
         .optional => |o| canReadAlloc(o.child),
@@ -693,7 +760,15 @@ fn allCanReadAlloc(comptime types: []const type) bool {
 /// Reads the value at `idx` as a `T` that owns all its memory: strings and
 /// slices are copied with `gpa`, handles are new references, and usertypes
 /// are deep copies. Release the result with `free`.
+///
+/// The copy is as large as the table says: a thousand keys holding the same
+/// long string cost a thousand copies, and `gpa` is not the state's memory
+/// limit. Give untrusted input a bounded allocator.
 pub fn toAlloc(comptime T: type, gpa: std.mem.Allocator, L: *lua_State, idx: c_int) AllocError!T {
+    return toAllocAt(T, gpa, L, idx, 0);
+}
+
+fn toAllocAt(comptime T: type, gpa: std.mem.Allocator, L: *lua_State, idx: c_int, depth: u32) AllocError!T {
     if (comptime !canReadAlloc(T)) @compileError("zilua: cannot read " ++ @typeName(T) ++ " from Lua");
     if (comptime isString(T)) {
         const s = try to([]const u8, L, idx);
@@ -710,15 +785,16 @@ pub fn toAlloc(comptime T: type, gpa: std.mem.Allocator, L: *lua_State, idx: c_i
         if (usertype.isDead(L, T, idx)) return error.Dead;
         if (api.typeOf(L, idx) != .table) return error.TypeMismatch;
         if (comptime !allCanReadAlloc(@typeInfo(T).@"struct".field_types)) return error.TypeMismatch;
-        return tableToStruct(T, gpa, L, idx);
+        return tableToStruct(T, gpa, L, idx, depth);
     }
     switch (@typeInfo(T)) {
         .optional => |o| {
             if (api.isNoneOrNil(L, idx)) return null;
-            return try toAlloc(o.child, gpa, L, idx);
+            return try toAllocAt(o.child, gpa, L, idx, depth);
         },
         .pointer => |p| {
             if (api.typeOf(L, idx) != .table) return error.TypeMismatch;
+            try enterNesting(L, depth);
             const t = api.absIndex(L, idx);
             // #t can be far larger than the number of elements (keys 1, 2,
             // 4, ..., 2^30 make a border at 2^30), so make sure the sequence
@@ -738,43 +814,14 @@ pub fn toAlloc(comptime T: type, gpa: std.mem.Allocator, L: *lua_State, idx: c_i
             for (items, 1..) |*item, i| {
                 _ = api.rawGetI(L, t, @intCast(i));
                 defer api.pop(L, 1);
-                item.* = try toAlloc(p.child, gpa, L, -1);
+                item.* = try toAllocAt(p.child, gpa, L, -1, depth + 1);
                 filled = i;
             }
             return items;
         },
-        .array => |a| {
-            if (api.typeOf(L, idx) != .table) return error.TypeMismatch;
-            if (api.rawLen(L, idx) != a.len) return error.TypeMismatch;
-            const t = api.absIndex(L, idx);
-            var result: T = undefined;
-            var filled: usize = 0;
-            errdefer {
-                for (result[0..filled]) |item| free(gpa, item);
-            }
-            for (&result, 1..) |*item, i| {
-                _ = api.rawGetI(L, t, @intCast(i));
-                defer api.pop(L, 1);
-                item.* = try toAlloc(a.child, gpa, L, -1);
-                filled = i;
-            }
-            return result;
-        },
-        .@"struct" => |s| {
-            if (api.typeOf(L, idx) != .table) return error.TypeMismatch;
-            const t = api.absIndex(L, idx);
-            var result: T = undefined;
-            var filled: usize = 0;
-            errdefer releaseFields(T, gpa, &result, filled);
-            inline for (s.field_names, s.field_types, 1..) |name, FT, i| {
-                _ = api.rawGetI(L, t, i);
-                defer api.pop(L, 1);
-                @field(result, name) = try toAlloc(FT, gpa, L, -1);
-                filled = i;
-            }
-            return result;
-        },
-        .@"union" => return toUnion(T, gpa, L, idx),
+        .array => |a| return readArray(T, a.len, a.child, gpa, L, idx, depth),
+        .@"struct" => return readTuple(T, gpa, L, idx, depth),
+        .@"union" => return toUnion(T, gpa, L, idx, depth + 1),
         else => return to(T, L, idx),
     }
 }
@@ -860,19 +907,100 @@ pub fn free(gpa: std.mem.Allocator, value: anytype) void {
 // ---------------------------------------------------------------------------
 // Handles
 
-/// Releases a zilua handle (or optional handle). Other values need no
-/// cleanup without an allocator.
-pub fn releaseHandle(value: anytype) void {
+/// Releases every handle in `value`: it owns them, wherever they sit (a
+/// field, an element, a union payload). Values without handles need no
+/// cleanup when no allocator was involved.
+pub fn releaseHandles(value: anytype) void {
+    walkHandles(value, releaseNow);
+}
+
+/// Like `releaseHandles`, from inside a finalizer: Luau runs those during
+/// collection, when the Lua API is off limits, so the references are queued
+/// for the next call from Zig.
+pub fn deferHandles(value: anytype) void {
+    walkHandles(value, releaseLater);
+}
+
+fn releaseNow(r: ref.Ref) void {
+    r.deinit();
+}
+
+fn releaseLater(r: ref.Ref) void {
+    r.state.deferUnref(r.id);
+}
+
+fn walkHandles(value: anytype, comptime onHandle: fn (ref.Ref) void) void {
     const T = @TypeOf(value);
     if (comptime isRefType(T)) {
-        value.deinit();
-    } else if (@typeInfo(T) == .optional) {
-        if (value) |v| releaseHandle(v);
+        if (handleRef(value)) |r| onHandle(r);
+        return;
+    }
+    if (comptime !hasHandles(T)) return;
+    switch (@typeInfo(T)) {
+        .optional => if (value) |v| walkHandles(v, onHandle),
+        .array => for (value) |item| walkHandles(item, onHandle),
+        .@"struct" => |s| inline for (s.field_names, s.field_attrs) |name, attrs| {
+            if (!attrs.@"comptime") walkHandles(@field(value, name), onHandle);
+        },
+        .@"union" => switch (value) {
+            inline else => |payload| walkHandles(payload, onHandle),
+        },
+        // Slices and pointers are only read with an allocator, which `free`
+        // handles instead.
+        else => {},
     }
 }
 
+/// A new, independent copy of `value` with every handle in it cloned.
+pub fn cloneHandles(value: anytype) @TypeOf(value) {
+    const T = @TypeOf(value);
+    if (comptime isRefType(T)) return cloneHandle(value);
+    if (comptime !hasHandles(T)) return value;
+    switch (@typeInfo(T)) {
+        .optional => return if (value) |v| cloneHandles(v) else null,
+        .array => {
+            var result = value;
+            for (&result) |*item| item.* = cloneHandles(item.*);
+            return result;
+        },
+        .@"struct" => |s| {
+            var result = value;
+            inline for (s.field_names, s.field_attrs) |name, attrs| {
+                if (!attrs.@"comptime") @field(result, name) = cloneHandles(@field(value, name));
+            }
+            return result;
+        },
+        .@"union" => switch (value) {
+            inline else => |payload, tag| return @unionInit(T, @tagName(tag), cloneHandles(payload)),
+        },
+        else => return value,
+    }
+}
+
+/// Whether a value of `T` can hold a handle by value.
+pub fn hasHandles(comptime T: type) bool {
+    if (isRefType(T)) return true;
+    return switch (@typeInfo(T)) {
+        .optional => |o| hasHandles(o.child),
+        .array => |a| hasHandles(a.child),
+        .@"struct" => |s| blk: {
+            for (s.field_types) |FT| {
+                if (hasHandles(FT)) break :blk true;
+            }
+            break :blk false;
+        },
+        .@"union" => |u| blk: {
+            for (u.field_types) |FT| {
+                if (hasHandles(FT)) break :blk true;
+            }
+            break :blk false;
+        },
+        else => false,
+    };
+}
+
 /// The underlying reference of a handle or optional handle, if any.
-pub fn handleRef(value: anytype) ?ref.Ref {
+fn handleRef(value: anytype) ?ref.Ref {
     const T = @TypeOf(value);
     if (T == ref.Ref) return value;
     if (comptime isRefType(T)) return value.ref;
@@ -889,13 +1017,25 @@ fn cloneHandle(value: anytype) @TypeOf(value) {
 }
 
 /// Releases what the first `filled` fields of a partly built struct or
-/// tuple hold: with `gpa` everything `free` would, otherwise only handles.
-/// Nested structs are left alone without `gpa`: by-value usertypes are
-/// copies whose handles belong to the original.
+/// tuple hold: with `gpa` everything `free` would, otherwise the handles,
+/// which a value read from Lua owns wherever they sit.
 fn releaseFields(comptime T: type, gpa: ?std.mem.Allocator, result: *const T, filled: usize) void {
     inline for (@typeInfo(T).@"struct".field_names, @typeInfo(T).@"struct".field_attrs, 0..) |name, attrs, i| {
-        if (!attrs.@"comptime" and i < filled) {
-            if (gpa) |a| free(a, @field(result.*, name)) else releaseHandle(@field(result.*, name));
-        }
+        if (!attrs.@"comptime" and i < filled) releaseItem(gpa, @field(result.*, name));
     }
+}
+
+/// Releases one value read from Lua: with `gpa` everything `free` would,
+/// otherwise the handles, which a value read without one still owns.
+fn releaseItem(gpa: ?std.mem.Allocator, value: anytype) void {
+    if (gpa) |a| free(a, value) else releaseHandles(value);
+}
+
+/// For the conversions that take no allocator: they share their readers with
+/// `toAlloc`, whose error set has one member more.
+fn noAlloc(result: anytype) Error!@typeInfo(@TypeOf(result)).error_union.payload {
+    return result catch |err| switch (err) {
+        error.OutOfMemory => unreachable, // nothing allocates without gpa
+        else => |e| return e,
+    };
 }

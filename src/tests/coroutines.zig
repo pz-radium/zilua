@@ -313,11 +313,7 @@ test "Scheduler: jobs keep their std.Io and room for many results" {
     try scheduler.spawn(task, .{});
     // The job finishes on the std.Io it started with.
     scheduler.io = null;
-    var spins: usize = 0;
-    while (scheduler.count() > 0 and spins < 5000) : (spins += 1) {
-        scheduler.update(0);
-        try io.sleep(.fromMilliseconds(1), .awake);
-    }
+    try helpers.drain(&scheduler, io);
     try testing.expectEqual(40, try lua.getGlobal(i64, "count"));
 }
 
@@ -349,11 +345,7 @@ test "Scheduler: only one task can wait for a job" {
     );
     try testing.expectEqual(1, Errors.seen);
     try testing.expectEqual(1, scheduler.count());
-    var spins: usize = 0;
-    while (scheduler.count() > 0 and spins < 5000) : (spins += 1) {
-        scheduler.update(0);
-        try io.sleep(.fromMilliseconds(1), .awake);
-    }
+    try helpers.drain(&scheduler, io);
     try testing.expectEqual(42, try lua.getGlobal(i64, "result"));
 }
 
@@ -387,12 +379,73 @@ test "Scheduler: tasks wait for std.Io jobs" {
     try scheduler.spawn(task, .{});
     try testing.expectEqual(1, scheduler.count());
 
-    var spins: usize = 0;
-    while (scheduler.count() > 0 and spins < 5000) : (spins += 1) {
-        scheduler.update(0);
-        try io.sleep(.fromMilliseconds(1), .awake);
-    }
+    try helpers.drain(&scheduler, io);
     try testing.expectEqual(0, scheduler.count());
     try testing.expectEqual(42, try lua.getGlobal(i64, "result"));
     try run(lua, "assert(value == nil and err == 'Nope')");
+}
+
+test "Scheduler: update refuses to run inside itself" {
+    const Errors = struct {
+        var reentered: u32 = 0;
+        var scheduler: ?*zilua.Scheduler = null;
+
+        fn onError(state: zilua.State, message: []const u8) void {
+            _ = state;
+            if (helpers.contains(message, "already running")) reentered += 1;
+        }
+
+        /// A bound function a task can call to pump the loop, which hosts do.
+        fn pump() void {
+            if (scheduler) |s| s.update(1);
+        }
+    };
+    const lua = try open();
+    defer lua.deinit();
+    var scheduler: zilua.Scheduler = .init(lua, testing.allocator);
+    defer scheduler.deinit();
+    Errors.reentered = 0;
+    Errors.scheduler = &scheduler;
+    defer Errors.scheduler = null;
+    scheduler.on_error = Errors.onError;
+    scheduler.registerWait("wait");
+    lua.setGlobal("pump", Errors.pump);
+
+    try run(lua, "function task() wait(0) pump() done = true end");
+    const task = try lua.getGlobal(zilua.Function, "task");
+    defer task.deinit();
+    try scheduler.spawn(task, .{});
+    scheduler.update(1);
+    try testing.expectEqual(1, Errors.reentered);
+    try testing.expectEqual(true, try lua.getGlobal(bool, "done"));
+    try testing.expectEqual(0, scheduler.count());
+}
+
+test "a coroutine that is running cannot be resumed from Zig" {
+    const Nested = struct {
+        /// Resumes the coroutine this runs on, which must fail without
+        /// touching its stack: the frame it is in is still in use.
+        fn again(lua: zilua.State, co: zilua.Thread) bool {
+            const top = zilua.api.getTop(lua.L);
+            resume_failed = if (co.run(void, .{})) |_| false else |_| true;
+            // Lua 5.1 reports the failure by writing its message over this
+            // frame's first slot, 5.4 and Luau by pushing it on top.
+            return zilua.api.getTop(lua.L) == top and zilua.api.typeOf(lua.L, 1) == .thread;
+        }
+        var resume_failed = false;
+    };
+    const lua = try open();
+    defer lua.deinit();
+    lua.setGlobal("again", Nested.again);
+
+    try run(lua, "function body() return again(coroutine.running()) end");
+    const body = try lua.getGlobal(zilua.Function, "body");
+    defer body.deinit();
+    const co = lua.newThread(body);
+    defer co.deinit();
+    // coroutine.running() is the coroutine itself on every runtime (only
+    // naming the main thread differs).
+    try testing.expectEqual(true, (try co.run(bool, .{})).returned);
+    try testing.expect(Nested.resume_failed);
+    try testing.expectEqual(.dead, co.status());
 }

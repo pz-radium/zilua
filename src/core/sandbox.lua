@@ -47,6 +47,9 @@ end
 
 if options.string and string then
   env.string = copy(string)
+  -- Removed from the name, not from strings: every string shares one
+  -- metatable with the host, so ("").dump is still the real function. There
+  -- is no loader in here to run what it writes (see Sandbox.zig).
   env.string.dump = nil
 end
 if options.table and table then env.table = copy(table) end

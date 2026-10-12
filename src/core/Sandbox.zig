@@ -15,6 +15,18 @@
 //! long string, for instance) is not counted: the limit bounds what a script
 //! does, not wall-clock time. For a hard time limit, run untrusted scripts in
 //! a separate process.
+//!
+//! What the limits do not cover:
+//! - Compiling a chunk. `doString` parses the source before any of it runs,
+//!   with the memory limit in place but the instruction limit not yet
+//!   counting; on Luau the compiler allocates outside the Lua state, so the
+//!   memory limit does not see it either. Keep untrusted sources small.
+//! - Reading a string from the shared `string` library through a string
+//!   value: `("").rep` is the real function, since every string shares one
+//!   metatable with the host. The copy in the environment hides a name
+//!   (`string.dump`) from `string.dump`, not from `("").dump`. Nothing
+//!   reachable that way escapes the limits, and the table cannot be written
+//!   to, but a sandbox cannot take a function away from strings.
 
 const std = @import("std");
 const api = @import("../runtime/api.zig");
@@ -56,6 +68,11 @@ pub const Options = struct {
     /// resolved when code is loaded (Luau's fast paths). Code loaded earlier
     /// then keeps seeing the old value of a global that later code redefines,
     /// so leave it off for scripts that are reloaded or extend each other.
+    ///
+    /// Only for code you trust: a resolved builtin is called directly, so
+    /// the environment's own `getmetatable` and `setmetatable` wrappers (and
+    /// with them the `__gc` refusal, which the instruction limit relies on)
+    /// are bypassed. It is a speed switch, not part of the sandbox.
     luau_fast_builtins: bool = false,
 };
 
@@ -111,15 +128,22 @@ pub fn load(self: Sandbox, source: []const u8, chunkname: [:0]const u8) State.Er
 
 /// Calls the sandbox's global function `name` under the sandbox's limits.
 pub fn call(self: Sandbox, comptime R: type, name: [:0]const u8, args: anytype) State.Error!R {
-    const L = self.state.L;
-    try self.state.reserveCall(@TypeOf(args), R);
-    self.env.push(L);
-    // Raw: the script may have given its environment an __index that raises.
-    api.pushString(L, name);
-    _ = api.rawGet(L, -2);
-    api.remove(L, -2);
-    const nargs = convert.pushMulti(L, args);
+    const nargs = try self.state.prepareCall(R, args, Member{ .env = self.env, .name = name });
     const saved = self.state.applyLimits(self.limits.memory, self.limits.instructions);
     defer self.state.restoreLimits(saved);
     return self.state.callStack(R, nargs);
 }
+
+/// A function of the sandbox's environment, as a `State.prepareCall` target.
+const Member = struct {
+    env: ref.Table,
+    name: [:0]const u8,
+
+    pub fn push(self: Member, L: *api.lua_State) void {
+        self.env.push(L);
+        // Raw: the script may have given its environment an __index that raises.
+        api.pushString(L, self.name);
+        _ = api.rawGet(L, -2);
+        api.remove(L, -2);
+    }
+};

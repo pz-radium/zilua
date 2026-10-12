@@ -122,13 +122,13 @@ test "Lua-owned values release the handles in their fields" {
     try run(lua, "warmup = make(); warmup.data = {}; warmup = nil");
     lua.collectGarbage();
     try run(lua, "x = 0");
-    const before = helpers.registryTables(lua);
+    const before = helpers.registryValues(lua, .table);
     try run(lua, churn);
     lua.collectGarbage();
     lua.collectGarbage();
     // Luau releases at the next call from Zig (its finalizers cannot).
     try run(lua, "x = 1");
-    try testing.expectEqual(before, helpers.registryTables(lua));
+    try testing.expectEqual(before, helpers.registryValues(lua, .table));
 }
 
 test "handle parameters are released after the call" {
@@ -136,7 +136,7 @@ test "handle parameters are released after the call" {
     defer lua.deinit();
     lua.setGlobal("length", holders.length);
     try run(lua, "length({ 1 })");
-    const before = helpers.registryTables(lua);
+    const before = helpers.registryValues(lua, .table);
     try run(lua, "for i = 1, 500 do assert(length({ 1, 2 }) == 2) end");
-    try testing.expectEqual(before, helpers.registryTables(lua));
+    try testing.expectEqual(before, helpers.registryValues(lua, .table));
 }

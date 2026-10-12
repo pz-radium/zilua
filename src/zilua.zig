@@ -39,6 +39,11 @@ pub const toAlloc = convert.toAlloc;
 pub const free = convert.free;
 /// A deep copy: slices copied, handles cloned. Release it with `free`.
 pub const dupe = convert.dupe;
+/// Releases every handle in a value read from Lua, wherever it sits: the
+/// value owns them (see `State.getGlobal`, `Args.get`).
+pub const releaseHandles = convert.releaseHandles;
+/// How deeply tables may nest while being read into a Zig value.
+pub const max_depth = convert.max_depth;
 
 pub const exportModule = module.exportModule;
 pub const module = @import("core/module.zig");

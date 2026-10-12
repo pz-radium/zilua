@@ -147,6 +147,9 @@ pub const LUA_VERSION_NUM: Number = switch (lang) {
 // Functions whose signature differs between runtimes are bound with @extern
 // so that each variant can keep the real C symbol name.
 pub const lua_newstate = if (lang == .lua55) lua_newstate_55 else lua_newstate_51;
+/// Lua 5.5 only: a seed for `lua_newstate`, from the clock and an address
+/// (what `luaL_newstate` uses). The state argument is unused, so null works.
+pub extern fn luaL_makeseed(L: ?*lua_State) c_uint;
 const lua_newstate_51 = @extern(*const fn (f: Alloc, ud: ?*anyopaque) callconv(.c) ?*lua_State, .{ .name = "lua_newstate" });
 const lua_newstate_55 = @extern(*const fn (f: Alloc, ud: ?*anyopaque, seed: c_uint) callconv(.c) ?*lua_State, .{ .name = "lua_newstate" });
 
@@ -284,6 +287,9 @@ pub const LUA_MASKCOUNT: c_int = 1 << 3;
 pub extern fn lua_sethook(L: *lua_State, func: ?Hook, mask: c_int, count: c_int) void;
 pub extern fn lua_setupvalue(L: *lua_State, funcindex: c_int, n: c_int) ?[*:0]const u8;
 pub extern fn lua_getstack(L: *lua_State, level: c_int, ar: *anyopaque) c_int;
+/// Lua 5.1 only (LuaJIT declares it but does not define it): copies the C
+/// call count of `from` to `to`, as `coroutine.resume` does.
+pub extern fn lua_setlevel(from: *lua_State, to: *lua_State) void;
 pub extern fn lua_getinfo(L: *lua_State, what: [*:0]const u8, ar: *anyopaque) c_int; // not Luau
 
 /// `lua_Debug` of Lua 5.1, for the traceback it lacks (`api.traceback`).

@@ -62,7 +62,8 @@ pub const Type = enum(c_int) {
     thread = 8,
     /// Luau only.
     vector = 9,
-    /// Luau only.
+    /// Luau only. LuaJIT reports its FFI cdata with this number as well;
+    /// both are opaque to zilua, which accepts neither as a value.
     buffer = 10,
     _,
 };
@@ -111,14 +112,11 @@ pub const LoadMode = enum {
 /// Creates a state that allocates through `alloc`. Returns null on failure.
 pub fn newState(alloc: Alloc, ud: ?*anyopaque) ?*lua_State {
     switch (lang) {
-        .lua55 => {
-            // Lua 5.5 takes the string hash seed from the caller. The address
-            // of `ud` gives per-process variation through ASLR, which is
-            // what luai_makeseed relies on as well.
-            const addr: u64 = if (ud) |p| @intFromPtr(p) else 0;
-            const seed: c_uint = @truncate(addr ^ (addr >> 32));
-            return c.lua_newstate(alloc, ud, seed);
-        },
+        // 5.5 takes the string hash seed from the caller; this is the one
+        // Lua makes for itself in luaL_newstate, from the clock and an
+        // address. A predictable seed would let a script collide the hashes
+        // of table keys it chooses.
+        .lua55 => return c.lua_newstate(alloc, ud, c.luaL_makeseed(null)),
         else => return c.lua_newstate(alloc, ud),
     }
 }
@@ -402,11 +400,17 @@ pub fn toPointer(L: *lua_State, idx: c_int) ?*const anyopaque {
 }
 
 /// Raw length: string length, userdata size, or table border (no `__len`).
+///
+/// A table border can be any key a script put in the table, so it may not
+/// fit a `usize` on a 32-bit target: it saturates instead of trapping.
 pub fn rawLen(L: *lua_State, idx: c_int) usize {
     switch (lang) {
         .lua51, .luajit => return c.lua_objlen(L, idx),
         .luau => return @intCast(luau.lua_objlen(L, idx)),
-        else => return @intCast(c.lua_rawlen(L, idx)),
+        else => {
+            const n = c.lua_rawlen(L, idx);
+            return std.math.cast(usize, n) orelse std.math.maxInt(usize);
+        },
     }
 }
 
@@ -710,8 +714,19 @@ pub fn getUserValue(L: *lua_State, idx: c_int) Type {
             return ty;
         },
         .lua51, .luajit => {
+            // No user value on these: it is the userdata's environment,
+            // which starts out as the environment of the function that
+            // created it. The globals table means nothing was stored; a
+            // userdata created by code with an environment of its own (in a
+            // sandbox) still reports that one.
             c.lua_getfenv(L, idx);
-            return typeOf(L, -1);
+            pushGlobalTable(L);
+            const is_globals = rawEqual(L, -1, -2);
+            pop(L, 1);
+            if (!is_globals) return typeOf(L, -1);
+            pop(L, 1);
+            pushNil(L);
+            return .nil;
         },
         .lua52 => {
             c.lua_getuservalue(L, idx);
@@ -734,8 +749,15 @@ pub fn setUserValue(L: *lua_State, idx: c_int) void {
             rawSet(L, -3);
             pop(L, 2);
         },
-        .lua51, .luajit => _ = c.lua_setfenv(L, idx),
-        .lua52, .lua53 => c.lua_setuservalue(L, idx),
+        .lua51, .luajit, .lua52 => {
+            // These store it as the userdata's environment, which has to be
+            // a table (5.2 also takes nil). Only Lua's own `api_check`,
+            // compiled in for debug builds, stops anything else.
+            const ty = typeOf(L, -1);
+            std.debug.assert(ty == .table or (lang == .lua52 and ty == .nil));
+            if (comptime lang == .lua52) c.lua_setuservalue(L, idx) else _ = c.lua_setfenv(L, idx);
+        },
+        .lua53 => c.lua_setuservalue(L, idx),
         else => _ = c.lua_setiuservalue(L, idx, 1),
     }
 }
@@ -773,14 +795,52 @@ pub fn pcall(L: *lua_State, nargs: c_int, nresults: c_int, msgh: c_int) Status {
     }
 }
 
+/// A Zig function run by `callProtected`, with the `ud` given to it. Returns
+/// the number of values it pushed, as a `CFunction` does.
+pub const ProtectedFn = *const fn (L: *lua_State, ud: ?*anyopaque) callconv(.c) c_int;
+
+/// Its address is the registry key of the closure `callProtected` uses.
+var protected_key: u8 = 0;
+
+/// Creates the closure `callProtected` needs, so that it never has to make
+/// one outside protected mode (5.1, LuaJIT and Luau allocate for a closure).
+/// Called once per state; without it `callProtected` still works, but its
+/// first step may raise.
+pub fn initProtected(L: *lua_State) void {
+    pushCFunction(L, protectedDispatch);
+    rawSetP(L, registry_index, &protected_key);
+}
+
+/// Runs `f(L, ud)` in protected mode, keeping its top `nresults` values.
+/// Nothing is allocated before the protected call starts, so a memory error
+/// inside `f` cannot longjmp past Zig code that owns memory or handles.
+///
+/// On failure the error object is left on the stack. The caller must have
+/// room for 3 values plus `nresults`.
+pub fn callProtected(L: *lua_State, f: ProtectedFn, ud: ?*anyopaque, nresults: c_int) Status {
+    if (rawGetP(L, registry_index, &protected_key) != .function) {
+        pop(L, 1);
+        pushCFunction(L, protectedDispatch);
+    }
+    pushLightUserdata(L, @as(*const anyopaque, @ptrCast(f)));
+    pushLightUserdata(L, ud);
+    return pcall(L, 2, nresults, 0);
+}
+
+fn protectedDispatch(L_: ?*lua_State) callconv(.c) c_int {
+    const L = L_.?;
+    const f: ProtectedFn = @ptrCast(@alignCast(toUserdata(L, 1).?));
+    return f(L, toUserdata(L, 2));
+}
+
 /// Compiles `buf` and pushes the resulting function (or an error message).
 /// `mode` is ignored by 5.1, which always accepts binary chunks.
 pub fn loadBuffer(L: *lua_State, buf: []const u8, chunkname: [*:0]const u8, mode: LoadMode) Status {
     switch (lang) {
         .lua51 => {
-            // 5.1 has no mode argument: reject precompiled chunks ("\x1bLua") here.
-            if (mode == .text and buf.len > 0 and buf[0] == 0x1b) {
-                _ = pushFString(L, "attempt to load a binary chunk (mode is 't')");
+            // 5.1 has no mode argument, so the signature is checked here.
+            if (mode == .text and isBinaryChunk(buf)) {
+                _ = pushFString(L, binary_chunk_message);
                 return .syntax;
             }
             return toStatus(c.luaL_loadbuffer(L, buf.ptr, buf.len, chunkname));
@@ -802,9 +862,27 @@ pub fn loadBuffer(L: *lua_State, buf: []const u8, chunkname: [*:0]const u8, mode
     }
 }
 
+const LuauLoad = struct {
+    chunkname: [*:0]const u8,
+    bytecode: []const u8,
+    failed: bool = false,
+};
+
 fn luauLoad(L: *lua_State, chunkname: [*:0]const u8, bytecode: []const u8) Status {
+    // Protected: luau_load allocates, and a memory error raised here would
+    // longjmp past the Zig code that owns the compiled bytecode (and the
+    // file, for `loadFile`). The loaded function, or the error message it
+    // pushed instead, is the one value kept.
+    var args: LuauLoad = .{ .chunkname = chunkname, .bytecode = bytecode };
+    if (callProtected(L, luauLoadFn, &args, 1) != .ok) return .memory;
     // Compile errors are encoded in the bytecode and reported here.
-    return if (luau.luau_load(L, chunkname, bytecode.ptr, bytecode.len, 0) == 0) .ok else .syntax;
+    return if (args.failed) .syntax else .ok;
+}
+
+fn luauLoadFn(L: *lua_State, ud: ?*anyopaque) callconv(.c) c_int {
+    const args: *LuauLoad = @ptrCast(@alignCast(ud.?));
+    args.failed = luau.luau_load(L, args.chunkname, args.bytecode.ptr, args.bytecode.len, 0) != 0;
+    return 1;
 }
 
 pub fn loadFile(L: *lua_State, path: [*:0]const u8, mode: LoadMode) Status {
@@ -836,6 +914,15 @@ pub fn loadFile(L: *lua_State, path: [*:0]const u8, mode: LoadMode) Status {
             if (text.len > 0 and text[0] == '#') {
                 text = text[std.mem.indexOfScalar(u8, text, '\n') orelse text.len ..];
             }
+            // Refuse a precompiled chunk here rather than in `loadBuffer`,
+            // whose message would be pushed (and could raise) while the file
+            // and the chunkname are still held.
+            if (mode == .text and isBinaryChunk(text)) {
+                gpa.free(chunkname);
+                gpa.free(source);
+                _ = pushFString(L, binary_chunk_message);
+                return .syntax;
+            }
             // Loading runs in protected mode and never raises.
             const status = loadBuffer(L, text, chunkname.ptr, mode);
             gpa.free(chunkname);
@@ -845,6 +932,14 @@ pub fn loadFile(L: *lua_State, path: [*:0]const u8, mode: LoadMode) Status {
         else => return toStatus(c.luaL_loadfilex(L, path, mode.cString())),
     }
 }
+
+/// Whether `buf` holds a precompiled chunk ("\x1bLua"), which Lua 5.1 is
+/// the only runtime not to check for itself.
+fn isBinaryChunk(buf: []const u8) bool {
+    return buf.len > 0 and buf[0] == 0x1b;
+}
+
+const binary_chunk_message = "attempt to load a binary chunk (mode is 't')";
 
 /// Reads the whole file at `path` with C stdio into memory from `gpa`.
 fn readFileC(gpa: std.mem.Allocator, path: [*:0]const u8) error{ OutOfMemory, CannotOpen }![]u8 {
@@ -883,6 +978,30 @@ pub fn traceback(L: *lua_State, L1: *lua_State, msg: ?[*:0]const u8, level: c_in
         .lua51 => traceback51(L, L1, msg, level),
         else => c.luaL_traceback(L, L1, msg, level),
     }
+}
+
+/// `traceback` in protected mode, for use outside a protected call. False if
+/// building it failed (it allocates, and Luau's has no limit on the number
+/// of levels it shows); nothing is left on the stack then.
+pub fn tracebackProtected(L: *lua_State, L1: *lua_State, msg: ?[*:0]const u8, level: c_int) bool {
+    var args: TracebackArgs = .{ .L1 = L1, .msg = msg, .level = level };
+    if (callProtected(L, tracebackFn, &args, 1) != .ok) {
+        pop(L, 1);
+        return false;
+    }
+    return true;
+}
+
+const TracebackArgs = struct {
+    L1: *lua_State,
+    msg: ?[*:0]const u8,
+    level: c_int,
+};
+
+fn tracebackFn(L: *lua_State, ud: ?*anyopaque) callconv(.c) c_int {
+    const args: *TracebackArgs = @ptrCast(@alignCast(ud.?));
+    traceback(L, args.L1, args.msg, args.level);
+    return 1;
 }
 
 /// `luaL_traceback` for Lua 5.1, which lacks it. A port of 5.1's
@@ -956,9 +1075,56 @@ pub const ResumeResult = struct {
     nresults: c_int,
 };
 
+/// Whether `co` can be resumed: it yielded, or it has never run. Resuming a
+/// coroutine that is running, or that resumed another one, is an error whose
+/// message 5.1 and LuaJIT write over the stack of its live frame.
+pub fn isResumable(co: *lua_State) bool {
+    if (comptime lang == .luau) {
+        return switch (luau.lua_costatus(mainThread(co), co)) {
+            luau.LUA_COSUS => true,
+            // A coroutine that has never run is "suspended" on Luau too.
+            else => false,
+        };
+    }
+    return switch (threadStatus(co)) {
+        .yield => true,
+        // Status ok with no call frame: either fresh (its function is still
+        // the only value on its stack) or finished.
+        .ok => !isRunning(co) and getTop(co) > 0,
+        else => false,
+    };
+}
+
+/// Whether `L` is executing: running, or waiting for a coroutine it resumed.
+/// Its stack belongs to the frames it is in, so nothing may clear it.
+pub fn isRunning(L: *lua_State) bool {
+    if (comptime lang == .luau) {
+        return switch (luau.lua_costatus(mainThread(L), L)) {
+            luau.LUA_CORUN, luau.LUA_CONOR => true,
+            else => false,
+        };
+    }
+    // A suspended coroutine has status `yield`, and one that failed keeps
+    // its error status, so only these two can be in a call.
+    if (threadStatus(L) != .ok) return false;
+    var ar: DebugBuffer = undefined;
+    return c.lua_getstack(L, 0, &ar) != 0;
+}
+
+/// Room for any runtime's `lua_Debug`, which zilua only needs as scratch
+/// space for `lua_getstack` (Luau's is the largest, with a 256-byte buffer).
+const DebugBuffer = extern struct { bytes: [512]u8 align(16) };
+
 pub fn resumeThread(co: *lua_State, from: ?*lua_State, nargs: c_int) ResumeResult {
     switch (lang) {
         .lua51, .luajit => {
+            if (comptime lang == .lua51) {
+                // 5.1 has no `from`: give the coroutine the C call count of
+                // the thread resuming it (what luaB_coresume does), so that
+                // nested resumes share one budget instead of each starting
+                // over and together overflowing the native stack.
+                if (from) |f| c.lua_setlevel(f, co);
+            }
             const st = toStatus(c.lua_resume(co, nargs));
             return .{ .status = st, .nresults = c.lua_gettop(co) };
         },
@@ -1012,9 +1178,20 @@ pub fn callWithContinuation(L: *lua_State, nargs: c_int, ctx: isize, comptime k:
         },
         .luau => {
             // Luau gives the continuation no context, so the results must
-            // start at index 1: drop the `ctx` values below the function.
-            var i: isize = 0;
-            while (i < ctx) : (i += 1) remove(L, 1);
+            // start at index 1: drop the `ctx` values below the function by
+            // moving it and its arguments down over them (one pass, where
+            // `lua_remove` per value would be quadratic in the argument
+            // count, which a script chooses).
+            if (ctx > 0) {
+                const moved = nargs + 1;
+                const first: c_int = @intCast(ctx + 1);
+                var i: c_int = 0;
+                while (i < moved) : (i += 1) {
+                    pushValue(L, first + i);
+                    replace(L, 1 + i);
+                }
+                setTop(L, moved);
+            }
             call(L, nargs, c.LUA_MULTRET);
             // The call yielded, which it can when the calling C function has
             // a continuation (`pushCClosureCont`): Luau runs that once the
@@ -1104,11 +1281,9 @@ pub fn setStepHook(L: *lua_State, f: ?StepFn) void {
 /// Gives coroutine `co` the step hook set with `setStepHook`. PUC Lua hooks
 /// belong to each thread (a coroutine copies its creator's when created);
 /// LuaJIT's and Luau's are global, so there is nothing to do there.
-pub fn hookThread(co: *lua_State) void {
-    switch (lang) {
-        .luajit, .luau => {},
-        else => c.lua_sethook(co, &countHook, c.LUA_MASKCOUNT, @intCast(step_instructions)),
-    }
+pub fn hookThread(co: *lua_State, interval: c_int) void {
+    if (lang == .luajit or lang == .luau) return;
+    setStepInterval(co, interval);
 }
 
 /// Makes the step hook of thread `L` fire every `interval` instructions
@@ -1165,18 +1340,23 @@ pub fn allocUserdata(L: *lua_State) ?*anyopaque {
 /// Runs a full collection. Protected: on 5.2 and 5.3 an error in a `__gc`
 /// metamethod is re-thrown by the collection; it is dropped here.
 pub fn gcCollect(L: *lua_State) void {
-    pushCFunction(L, gcCollectFn);
-    if (pcall(L, 0, 0, 0) != .ok) pop(L, 1);
+    // Nothing is pushed before the protected call: making a closure for it
+    // would allocate, which can fail under a memory limit and raise here.
+    if (callProtected(L, gcCollectFn, null, 0) != .ok) pop(L, 1);
 }
 
-fn gcCollectFn(L: ?*lua_State) callconv(.c) c_int {
-    _ = c.lua_gc(L.?, c.LUA_GCCOLLECT, @as(c_int, 0));
+fn gcCollectFn(L: *lua_State, ud: ?*anyopaque) callconv(.c) c_int {
+    _ = ud;
+    _ = c.lua_gc(L, c.LUA_GCCOLLECT, @as(c_int, 0));
     return 0;
 }
 
 /// Bytes currently allocated by the state.
 pub fn gcCount(L: *lua_State) usize {
-    const kb: usize = @intCast(c.lua_gc(L, c.LUA_GCCOUNT, @as(c_int, 0)));
-    const rest: usize = @intCast(c.lua_gc(L, c.LUA_GCCOUNTB, @as(c_int, 0)));
-    return kb * 1024 + rest;
+    // From 5.4 on, every option returns -1 while the collector is stopped
+    // (inside a finalizer, or during lua_close).
+    const kb = c.lua_gc(L, c.LUA_GCCOUNT, @as(c_int, 0));
+    const rest = c.lua_gc(L, c.LUA_GCCOUNTB, @as(c_int, 0));
+    if (kb < 0 or rest < 0) return 0;
+    return @as(usize, @intCast(kb)) * 1024 + @as(usize, @intCast(rest));
 }

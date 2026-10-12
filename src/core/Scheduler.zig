@@ -39,6 +39,13 @@ tasks: std.ArrayList(Task) = .empty,
 jobs: std.ArrayList(*JobHeader) = .empty,
 /// The time given to the last `update`, in seconds.
 now: f64 = 0,
+/// An `update` is running: tasks may add and remove tasks while it does, so
+/// a second one would work from indices the first has already moved.
+updating: bool = false,
+/// Handed to the next job, so that a task holding on to the light userdata
+/// of a job that has finished cannot be matched with a later one at the
+/// same address. Pointer-sized, since that is what Lua carries it in.
+next_job_id: usize = 1,
 /// Called with the message (and traceback) of a task that failed, before
 /// the task is dropped.
 on_error: ?*const fn (state: State, message: []const u8) void = null,
@@ -104,18 +111,32 @@ pub fn spawn(self: *Scheduler, func: ref.Function, args: anytype) error{OutOfMem
 ///
 ///     try scheduler.spawnLimited(level, .{}, sandbox.limits);
 pub fn spawnLimited(self: *Scheduler, func: ref.Function, args: anytype, limits: ?Sandbox.Limits) error{OutOfMemory}!void {
+    // Room for the task first: running it may start a job that only a task
+    // waiting for it can finish, so failing to keep the task afterwards
+    // would leave that job behind.
+    try self.tasks.ensureUnusedCapacity(self.gpa, 1);
     const t = self.state.newThread(func);
     const co = t.state.L;
     if (!api.checkStack(co, convert.resultCount(@TypeOf(args)) + 4)) {
         t.deinit();
         return error.OutOfMemory;
     }
-    const wake = self.step(t, convert.pushMulti(co, args), limits) orelse {
+    const nargs = nargs: {
+        const work = self.state.beginHostWork();
+        defer work.end();
+        break :nargs convert.pushMulti(co, args);
+    };
+    const wake = self.step(t, nargs, limits) orelse {
         t.deinit();
         return;
     };
-    // Appended after running: the task may have spawned tasks of its own.
+    // Appended after running: the task may have spawned tasks of its own,
+    // which can have used up the room reserved above.
     self.tasks.append(self.gpa, .{ .thread = t, .wake = wake, .limits = limits }) catch |err| {
+        if (wake == .job) {
+            wake.job.cancel(wake.job);
+            self.forgetJob(wake.job);
+        }
         t.deinit();
         return err;
     };
@@ -125,6 +146,14 @@ pub fn spawnLimited(self: *Scheduler, func: ref.Function, args: anytype, limits:
 /// is over or whose job is done. Tasks spawned during the update first run
 /// again on the next one.
 pub fn update(self: *Scheduler, now: f64) void {
+    if (self.updating) {
+        // Called from a task, or from `on_error`: the outer `update` is in
+        // the middle of its list and would go on with stale indices.
+        self.report("Scheduler.update was called while it was already running", null);
+        return;
+    }
+    self.updating = true;
+    defer self.updating = false;
     self.now = now;
     var i: usize = 0;
     var remaining = self.tasks.items.len;
@@ -141,7 +170,12 @@ pub fn update(self: *Scheduler, now: f64) void {
                     i += 1;
                     continue;
                 }
+                // Pushing the result is zilua's own work, outside any
+                // protected call: a memory limit the task filled up must not
+                // turn it into an error (see `State.beginHostWork`).
+                const work = self.state.beginHostWork();
                 const n = job.finish(job, co);
+                work.end();
                 self.forgetJob(job);
                 break :blk n;
             },
@@ -182,9 +216,10 @@ fn step(self: *Scheduler, t: thread.Thread, nargs: c_int, limits: ?Sandbox.Limit
             if (!std.math.isNan(seconds)) return .{ .at = self.now + seconds };
         },
         .light_userdata => {
-            const ptr = api.toUserdata(co, first);
+            // Null (which a host can push) is 0, and no job has that id.
+            const token = @intFromPtr(api.toUserdata(co, first));
             for (self.jobs.items) |job| {
-                if (@as(?*anyopaque, job) != ptr) continue;
+                if (job.id != token) continue;
                 // A script can get hold of a job (by calling the function
                 // that starts it in a coroutine of its own) and yield it from
                 // several tasks. Only one may wait: the job is freed once it
@@ -274,7 +309,11 @@ pub fn of(state: State) ?*Scheduler {
 /// Zig work started with `startJob`. Yield it from a bound function
 /// (`return zilua.yield(job)`) to suspend the calling task until it is done.
 pub const Job = struct {
-    ptr: *JobHeader,
+    /// What a task yields, as a light userdata: the job's id, not its
+    /// address. An id is never reused, while an address would be, so a task
+    /// that kept the job it already waited for cannot be handed the result
+    /// of a later one.
+    ptr: *anyopaque,
 
     pub const zilua_special = {};
     pub const zilua_light_userdata = {};
@@ -282,6 +321,9 @@ pub const Job = struct {
 
 const JobHeader = struct {
     done: std.atomic.Value(bool) = .init(false),
+    /// Tells this job apart from a later one the allocator puts at the same
+    /// address, which a script holding the old light userdata could yield.
+    id: usize,
     /// A task waits for this job (see `step`).
     claimed: bool = false,
     /// The `std.Io` the work runs on, kept even if `Scheduler.io` changes.
@@ -313,13 +355,15 @@ pub fn startJob(self: *Scheduler, comptime function: anytype, args: std.meta.Arg
     const Impl = JobImpl(function);
     const impl = try self.gpa.create(Impl);
     errdefer self.gpa.destroy(impl);
+    const id = self.next_job_id;
+    self.next_job_id += 1;
     impl.* = .{
-        .header = .{ .io = io, .finish = Impl.finish, .cancel = Impl.cancel, .destroy = Impl.destroy },
+        .header = .{ .id = id, .io = io, .finish = Impl.finish, .cancel = Impl.cancel, .destroy = Impl.destroy },
         .args = args,
     };
     try self.jobs.append(self.gpa, &impl.header);
     impl.future = io.concurrent(Impl.run, .{impl}) catch io.async(Impl.run, .{impl});
-    return .{ .ptr = &impl.header };
+    return .{ .ptr = @ptrFromInt(id) };
 }
 
 fn forgetJob(self: *Scheduler, job: *JobHeader) void {

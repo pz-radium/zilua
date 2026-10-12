@@ -196,3 +196,74 @@ test "memory goes through the Zig allocator" {
     try run(lua, "local t = {} for i = 1, 1000 do t[i] = tostring(i) end");
     try testing.expect(lua.memoryUsed() > 0);
 }
+
+test "the instruction limit holds after a coroutine runs into it" {
+    const lua = try open();
+    defer lua.deinit();
+    lua.setInstructionLimit(50_000);
+    defer lua.setInstructionLimit(null);
+    // The limit is first exceeded inside a coroutine, which on PUC Lua owns
+    // its own hook; the main thread must still be stopped right after.
+    try testing.expectError(error.Runtime, lua.doString(
+        \\rounds = 0
+        \\local co = coroutine.create(function() while true do end end)
+        \\coroutine.resume(co)
+        \\local function spin() for _ = 1, 100000 do end end
+        \\while rounds < 50 do pcall(spin) rounds = rounds + 1 end
+    ));
+    try expectContains(lua.errorMessage(), "instruction limit exceeded");
+    // Catching the error buys no more than one hook interval of work.
+    try testing.expect((try lua.getGlobal(?i64, "rounds")).? < 50);
+}
+
+test "reading a value does not raise when a script filled the memory limit" {
+    const lua = try open();
+    defer lua.deinit();
+    try run(lua, "text = 0.1 + 2 ^ -40; function keep(t) return #t end");
+    lua.setMemoryLimit(lua.memoryUsed() + (64 << 10));
+    // The script uses up what is left, and keeps it.
+    lua.doString("held = {} while true do held[#held + 1] = { {} } end") catch {};
+    // Converting a number to a string allocates: it must not raise here,
+    // which outside a protected call would end the process.
+    const text = try lua.getGlobalAlloc(testing.allocator, []u8, "text");
+    defer testing.allocator.free(text);
+    try testing.expect(text.len > 0);
+    // So must taking a reference, and calling back into Lua.
+    const held = try lua.getGlobal(zilua.Table, "held");
+    defer held.deinit();
+    try testing.expect(try lua.call(i64, "keep", .{held}) > 0);
+    lua.setMemoryLimit(null);
+}
+
+test "a table that refers to itself does not run away" {
+    const Node = struct {
+        name: []const u8,
+        children: []@This(),
+    };
+    const lua = try open();
+    defer lua.deinit();
+    try run(lua, "t = { name = 'a', children = {} }; t.children[1] = t");
+    try testing.expectError(error.TooDeep, lua.getGlobalAlloc(testing.allocator, Node, "t"));
+    // The stack is left as it was, and the state stays usable.
+    try testing.expectEqual(0, lua.getTop());
+    try run(lua, "x = 1");
+}
+
+test "strings with embedded zeros are refused where a sentinel is expected" {
+    const funcs = struct {
+        fn name(path: [:0]const u8) usize {
+            return path.len;
+        }
+        fn any(path: []const u8) usize {
+            return path.len;
+        }
+    };
+    const lua = try open();
+    defer lua.deinit();
+    lua.setGlobal("name", funcs.name);
+    lua.setGlobal("any", funcs.any);
+    try run(lua, "assert(name('data.txt') == 8)");
+    try testing.expectError(error.Runtime, lua.doString("return name('data.txt\\0/etc/passwd')"));
+    // Without a sentinel the whole string is still readable.
+    try run(lua, "assert(any('a\\0b') == 3)");
+}

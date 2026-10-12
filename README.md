@@ -212,7 +212,11 @@ Slices are read from sequences: a `nil` before the end is an error.
 A struct can also be read from a Lua table, field by field. A missing field
 takes its default value, or `null` if it is optional; otherwise the read
 fails with `error.MissingField`. Structs with string or slice fields can be
-read from a table only with the `*Alloc` functions, which copy them.
+read from a table only with the `*Alloc` functions, which copy them. A type
+with a finalizer (`deinit`, `__gc`) is never built from a table: the value
+has to come from one zilua made, so that a script cannot choose what gets
+released. Tables nest at most `zilua.max_depth` deep, which is what stops a
+table that refers to itself being read into a type that refers to itself.
 
 ### Memory and lifetimes
 
@@ -228,13 +232,26 @@ read from a table only with the `*Alloc` functions, which copy them.
   touching freed memory. Lua has one userdata per object, so pushing the
   same pointer twice gives the same value.
 - A struct field that is itself a struct is returned as a reference into the
-  parent, and keeps the parent alive.
+  parent, and keeps the parent alive; so is a `*T` a bound function returns
+  that points into one of its arguments (`return self`). Such a reference
+  stops working with the value it points into.
+- A field whose type wraps something a finalizer releases (`?Item`,
+  `[]Item`, a union holding one, where `Item` has `deinit`) is neither read
+  nor assigned from Lua: a copy would release it a second time. Expose it as
+  a method returning `*Item` instead.
+- A value of a type with a finalizer is borrowed, not owned: it can be a
+  bound function's parameter, but `getGlobal(T, ...)` and `call(T, ...)`
+  refuse it at compile time. Read a `*T` instead. The `*Alloc` variants copy
+  a type whose finalizer only releases handles, which they clone, and refuse
+  one with a `deinit` or `__gc`: nothing can duplicate what that releases.
 - Strings and pointers read from Lua point into Lua memory. Arguments of
   bound functions are safe for the whole call; elsewhere use the `*Alloc`
   variants (`getGlobalAlloc`, `callAlloc`, `Table.getAlloc`, ...), which copy,
   and release the copy with `zilua.free(gpa, value)`.
-- Handles are released with `deinit`. Handle parameters of bound functions
-  are released after the call; `clone()` one to keep it.
+- Handles are released with `deinit`, exactly once: Lua hands a released
+  reference out again, so releasing twice would give two handles one slot.
+  Handle parameters of bound functions are released after the call, wherever
+  inside the parameter they sit; `clone()` one to keep it.
 
 ### Errors
 
@@ -332,9 +349,16 @@ try sandbox.call(void, "on_event", .{event});
   single library call such as pattern matching on a long string: it bounds
   what a script does, not wall-clock time. For a hard time limit, run
   untrusted scripts in a separate process.
-- On Luau the library copies are read-only, `.luau_fast_builtins = true`
-  enables Luau's safe-environment fast paths, and `lua.freezeGlobals()`
-  makes the shared globals read-only.
+- On Luau the library copies are read-only and `lua.freezeGlobals()` makes
+  the shared globals read-only. `.luau_fast_builtins = true` is a speed
+  switch for code you trust, not part of the sandbox: a resolved builtin is
+  called directly, so the environment's own `getmetatable` and
+  `setmetatable` (and the `__gc` refusal) are bypassed.
+- What the limits do not cover: compiling the chunk (the instruction limit
+  only starts counting once it runs, and on Luau the compiler allocates
+  outside the Lua state), and functions reachable through the metatable
+  every string shares with the host, where `("").rep` is the real one. Keep
+  untrusted sources small; nothing reachable that way escapes the limits.
 
 ### Hot reload
 
@@ -397,7 +421,13 @@ Bound functions taking a `zilua.State` work in modules too.
 
 - LuaJIT is not available on 32-bit ARM.
 - `CallThen` cannot yield on Lua 5.1 and LuaJIT, whose C APIs have no
-  continuations.
+  continuations. On Luau what follows a `callThen` cannot yield or use
+  `callThen` again (a compile error there): a Luau function carries one
+  continuation, chosen when it is pushed.
+- Deeply nested resumes from Zig (a task spawning tasks) are bounded by the
+  runtime's own C call limit, which zilua keeps across them. LuaJIT has no
+  way to carry that count over, so there the bound is zilua's own, lower
+  one.
 - Lua C modules on Windows need an import library for the host's Lua DLL,
   which zilua does not set up.
 

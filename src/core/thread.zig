@@ -14,7 +14,13 @@ const State = @import("State.zig");
 const ref = @import("ref.zig");
 
 /// Most calls from Zig into Lua that may be nested, like Lua's LUAI_MAXCCALLS.
-const max_nested_calls = 200;
+///
+/// Every runtime but LuaJIT is also told which thread a resume comes from
+/// (`api.resumeThread`), so its own C call counter spans nested resumes and
+/// stops them first. LuaJIT has no way to say, and counts from zero in each
+/// coroutine, so there this is the only bound on how deep nested resumes of
+/// deeply recursive scripts can go: it is lower.
+const max_nested_calls = if (api.lang == .luajit) 32 else 200;
 
 /// What a coroutine handed back from `Thread.run`.
 pub fn RunResult(comptime R: type) type {
@@ -58,6 +64,8 @@ pub const Thread = struct {
         ready,
         /// Yielded and waiting to be run again.
         suspended,
+        /// Running, or waiting for a coroutine it resumed. Cannot be run.
+        running,
         /// Returned or failed.
         dead,
     };
@@ -69,19 +77,22 @@ pub const Thread = struct {
     }
 
     pub fn deinit(self: Thread) void {
-        self.ref.deinit();
+        self.ref.deinitExpecting(.thread);
     }
 
     pub fn push(self: Thread, L: *api.lua_State) void {
         self.ref.push(L);
     }
 
-    /// Meaningful from outside the coroutine only: while it runs (from a
-    /// function it called) it reports `ready`.
     pub fn status(self: Thread) Status {
         return switch (api.threadStatus(self.state.L)) {
             .yield => .suspended,
-            .ok => if (api.getTop(self.state.L) > 0) .ready else .dead,
+            .ok => if (api.isRunning(self.state.L))
+                .running
+            else if (api.getTop(self.state.L) > 0)
+                .ready
+            else
+                .dead,
             else => .dead,
         };
     }
@@ -94,17 +105,24 @@ pub const Thread = struct {
         comptime convert.ensureOwned(R, "Thread.run");
         const co = self.state.L;
         const needed = comptime convert.resultCount(R);
-        if (!api.checkStack(co, convert.resultCount(@TypeOf(args)) + needed + 4)) return error.StackOverflow;
-
-        const nargs = convert.pushMulti(co, args);
+        const nargs = nargs: {
+            // Pushing and reading is zilua's own work, outside any protected
+            // call (see `State.beginHostWork`).
+            const work = self.state.beginHostWork();
+            defer work.end();
+            if (!api.checkStack(co, convert.resultCount(@TypeOf(args)) + needed + 4)) return error.StackOverflow;
+            break :nargs convert.pushMulti(co, args);
+        };
         const result = try self.resumeRaw(nargs);
 
+        const work = self.state.beginHostWork();
+        defer work.end();
         // Pad missing results with nil so every index read below exists.
         var count = result.nresults;
         while (count < needed) : (count += 1) api.pushNil(co);
         const top = api.getTop(co);
         defer api.setTop(co, top - count);
-        const values = try convert.toMulti(R, co, top - count + 1);
+        const values = try convert.readMulti(R, null, co, top - count + 1);
         return if (result.status == .yield) .{ .yielded = values } else .{ .returned = values };
     }
 
@@ -114,10 +132,17 @@ pub const Thread = struct {
     /// in `run`.
     pub fn resumeRaw(self: Thread, nargs: c_int) State.Error!api.ResumeResult {
         const co = self.state.L;
-        // Lua bounds nested C calls from the count of the resuming thread,
-        // which zilua cannot name (it passes the main thread), so it bounds
-        // nested calls from Zig itself: a task that spawns tasks that spawn
-        // tasks would otherwise overflow the native stack.
+        // Resuming a coroutine that is running, or that resumed another one,
+        // fails in every runtime, but 5.1 and LuaJIT report it by clearing
+        // the stack of its live frame first.
+        if (!api.isResumable(co)) {
+            api.pop(co, nargs);
+            self.state.ctx.setErrorMessage("cannot resume non-suspended coroutine");
+            return error.Runtime;
+        }
+        // Lua bounds nested C calls per thread, so zilua bounds nested calls
+        // from Zig as well: a task that spawns tasks that spawn tasks would
+        // otherwise overflow the native stack.
         if (self.state.ctx.depth >= max_nested_calls) {
             api.pop(co, nargs);
             self.state.ctx.setErrorMessage("C stack overflow");
@@ -126,7 +151,14 @@ pub const Thread = struct {
         self.state.enterCall();
         defer self.state.leaveCall();
         self.state.hookThread(co);
-        const result = api.resumeThread(co, self.state.ctx.main, nargs);
+        // The thread this resume comes from, so that the runtime counts the
+        // nested resumes against one C call budget. `running` is null for the
+        // outermost resume, where the main thread is the right answer.
+        const from = self.state.ctx.running orelse self.state.ctx.main;
+        const outer = self.state.ctx.running;
+        self.state.ctx.running = co;
+        const result = api.resumeThread(co, from, nargs);
+        self.state.ctx.running = outer;
         return switch (result.status) {
             .ok, .yield => result,
             else => self.state.captureThreadError(co, result.status),

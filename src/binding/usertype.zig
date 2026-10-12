@@ -29,6 +29,10 @@ pub const Header = extern struct {
     /// finalizer may still resurrect the userdata), or the Zig object of a
     /// reference was detached with `invalidate`.
     dead: bool = false,
+    /// For a reference into another value (a struct field, an element): the
+    /// header of the value it points into, which dies first. Kept alive by
+    /// the reference's user value (see `anchor`), so it never dangles.
+    parent: ?*Header = null,
 };
 
 /// Registry name of the metatable of `T` (as with `luaL_newmetatable`, for
@@ -124,32 +128,53 @@ fn finalizer(comptime T: type) Finalizer {
 
 fn hasHandleFields(comptime T: type) bool {
     for (@typeInfo(T).@"struct".field_types) |FT| {
-        if (convert.isHandleLike(FT)) return true;
+        if (convert.hasHandles(FT)) return true;
     }
     return false;
 }
 
 /// Whether a bitwise copy of a `T` read from Lua would share something a
 /// finalizer releases (memory freed by `deinit`/`__gc`, handles), so that
-/// assigning one to a field would give it two owners.
-fn copyShares(comptime T: type) bool {
+/// assigning one to a field, or keeping one, would give it two owners.
+pub fn copyShares(comptime T: type) bool {
+    return containsFinalized(T, .any);
+}
+
+/// Whether `T`, or a value inside it, has a destructor zilua would call
+/// (`deinit` or `__gc`). Unlike the handles `copyShares` also covers, what a
+/// destructor releases cannot be duplicated, so no copy can own it.
+pub fn hasDestructor(comptime T: type) bool {
+    return containsFinalized(T, .destructors);
+}
+
+/// Whether `T` holds, by value, a usertype that zilua finalizes: looking
+/// through optionals, arrays, unions, tuples and the fields of a usertype.
+/// `.destructors` leaves out the types whose finalizer only releases
+/// handles, which a copy can take its own references to.
+fn containsFinalized(comptime T: type, comptime kind: enum { any, destructors }) bool {
     switch (@typeInfo(T)) {
-        .optional => |o| return copyShares(o.child),
-        .array => |a| return copyShares(a.child),
+        .optional => |o| return containsFinalized(o.child, kind),
+        .array => |a| return containsFinalized(a.child, kind),
         .@"union" => |u| {
             for (u.field_types) |FT| {
-                if (copyShares(FT)) return true;
+                if (containsFinalized(FT, kind)) return true;
             }
             return false;
         },
         .@"struct" => |s| {
             if (convert.isUsertype(T)) {
-                if (finalizer(T) != .none) return true;
+                switch (finalizer(T)) {
+                    .gc_decl, .deinit_ptr, .deinit_value, .unsupported => return true,
+                    .handles => if (kind == .any) return true,
+                    .none => {},
+                }
             } else if (!s.is_tuple) {
+                // A handle or one of zilua's own types: nothing inside it
+                // belongs to the value holding it.
                 return false;
             }
             for (s.field_types) |FT| {
-                if (copyShares(FT)) return true;
+                if (containsFinalized(FT, kind)) return true;
             }
             return false;
         },
@@ -215,6 +240,13 @@ const cache_read_only = 2;
 /// with `invalidate` first. Lua gets one userdata per object, type and
 /// mutability, which is how `invalidate` finds it.
 pub fn pushRef(L: *lua_State, comptime T: type, ptr: anytype, read_only: bool) void {
+    pushRefIn(L, T, ptr, read_only, null);
+}
+
+/// `pushRef` for a reference that points into the value of `parent` (one of
+/// its fields, or an element inside one), so that it dies with it. Anchor it
+/// to the parent's userdata as well, or that header could be freed first.
+pub fn pushRefIn(L: *lua_State, comptime T: type, ptr: anytype, read_only: bool, parent: ?*Header) void {
     comptime validate(T);
     const mutable: *T = @constCast(ptr);
     pushMetatable(L, T);
@@ -222,7 +254,7 @@ pub fn pushRef(L: *lua_State, comptime T: type, ptr: anytype, read_only: bool) v
     if (api.rawGetP(L, -1, mutable) != .userdata) {
         api.pop(L, 1);
         const header: *Header = @ptrCast(@alignCast(api.newUserdata(L, @sizeOf(Header))));
-        header.* = .{ .ptr = mutable, .owned = false, .read_only = read_only };
+        header.* = .{ .ptr = mutable, .owned = false, .read_only = read_only, .parent = parent };
         api.pushValue(L, -3);
         api.setMetatable(L, -2);
         api.pushValue(L, -1);
@@ -264,14 +296,24 @@ pub fn invalidate(L: *lua_State, comptime T: type, ptr: *const T) void {
 /// that is still alive (see `Header.dead`).
 pub fn check(L: *lua_State, comptime T: type, idx: c_int) ?*Header {
     const header = headerOf(L, T, idx) orelse return null;
-    return if (header.dead) null else header;
+    return if (isHeaderDead(header)) null else header;
 }
 
 /// Whether the value at `idx` is a `T` userdata that `check` refuses only
 /// because it is dead.
 pub fn isDead(L: *lua_State, comptime T: type, idx: c_int) bool {
     const header = headerOf(L, T, idx) orelse return false;
-    return header.dead;
+    return isHeaderDead(header);
+}
+
+/// Whether the value is gone, or the value it points into is: a reference
+/// to a field outlives neither the object it belongs to nor its finalizer.
+pub fn isHeaderDead(header: *const Header) bool {
+    var level: ?*const Header = header;
+    while (level) |h| : (level = h.parent) {
+        if (h.dead) return true;
+    }
+    return false;
 }
 
 /// The header of the value at `idx` if it is a `T` userdata created by
@@ -301,6 +343,16 @@ fn raiseDead(L: *lua_State, comptime T: type) c_int {
     return api.raiseF(L, "%s no longer exists", displayName(T).ptr);
 }
 
+/// Ties the reference at `child` to the value at `parent` it points into:
+/// the parent stays alive while the reference does, and the reference stops
+/// working once the parent is finalized or detached.
+pub fn anchorIn(L: *lua_State, comptime Child: type, child: c_int, comptime Parent: type, parent: c_int) void {
+    anchor(L, child, parent);
+    const owner = check(L, Parent, parent) orelse return;
+    const header = check(L, Child, child) orelse return;
+    if (header.parent == null and header != owner) header.parent = owner;
+}
+
 /// Makes the userdata at `child` keep the value at `parent` alive, for
 /// references into the parent's memory.
 fn anchor(L: *lua_State, child: c_int, parent: c_int) void {
@@ -326,8 +378,6 @@ pub fn pushMetatable(L: *lua_State, comptime T: type) void {
     api.pop(L, 1);
     _ = api.newMetatable(L, metatableName(T).ptr);
     const mt = api.getTop(L);
-    api.pushValue(L, mt);
-    api.rawSetP(L, api.registry_index, typeKey(T));
 
     // Reference caches (see `pushRef`), with weak values so that they keep
     // no reference alive.
@@ -385,6 +435,13 @@ pub fn pushMetatable(L: *lua_State, comptime T: type) void {
         api.pushCFunction(L, eqFn(T));
         api.setField(L, mt, "__eq");
     }
+
+    // Registered last: setting the fields above allocates, and failing
+    // halfway would otherwise leave a metatable that every later push takes
+    // for a finished one (no caches, no __gc, no lock). Lua keyed it by name
+    // already, so a second attempt fills in the same table.
+    api.pushValue(L, mt);
+    api.rawSetP(L, api.registry_index, typeKey(T));
 }
 
 /// Public functions of `T` whose parameter and return types zilua can
@@ -431,7 +488,7 @@ fn indexFn(comptime T: type) api.CFunction {
             if (api.typeOf(L, 2) != .string) return 0;
             const key = api.toLString(L, 2).?;
             const header = headerWith(L, 1, api.upvalueIndex(2)) orelse return 0;
-            if (header.dead) return raiseDead(L, T);
+            if (isHeaderDead(header)) return raiseDead(L, T);
             const self: *T = @ptrCast(@alignCast(header.ptr));
             const info = @typeInfo(T).@"struct";
             // Fields of a packed struct have no addressable memory of their own.
@@ -441,12 +498,21 @@ fn indexFn(comptime T: type) api.CFunction {
                 // Usertype fields are pushed as references, which Lua never finalizes.
                 if (comptime !(convert.canPush(FT) or (by_ref and convert.isUsertype(FT) and isValid(FT)))) continue;
                 if (std.mem.eql(u8, key, name)) {
+                    const as_reference = comptime by_ref and convert.isUsertype(FT) and isValid(FT);
+                    // Anything else is pushed as a copy Lua owns and later
+                    // finalizes: for a type wrapping what a finalizer
+                    // releases (`?Item`, `[]Item`, a union holding one) that
+                    // would be a second owner of the original's resources.
+                    if (comptime !as_reference and copyShares(FT)) {
+                        return api.raiseF(L, "cannot read %s.%s from Lua: a copy would share what its finalizer releases", displayName(T).ptr, name.ptr);
+                    }
                     if (attrs.@"comptime") {
                         convert.push(L, @field(self.*, name));
-                    } else if (comptime by_ref and convert.isUsertype(FT)) {
+                    } else if (as_reference) {
                         // A reference into the parent rather than a copy, so
-                        // that `body.pos.x = 1` modifies `body`.
-                        pushRef(L, FT, &@field(self.*, name), header.read_only);
+                        // that `body.pos.x = 1` modifies `body`, and one that
+                        // dies with the parent.
+                        pushRefIn(L, FT, &@field(self.*, name), header.read_only, header);
                         anchor(L, -1, 1);
                     } else {
                         convert.push(L, @field(self.*, name));
@@ -465,10 +531,10 @@ fn newIndexFn(comptime T: type) api.CFunction {
             const L = L_.?;
             const name_z = displayName(T).ptr;
             const header = headerWith(L, 1, api.upvalueIndex(1)) orelse return api.raiseF(L, "%s expected", name_z);
-            if (header.dead) return raiseDead(L, T);
+            if (isHeaderDead(header)) return raiseDead(L, T);
             if (header.read_only) return api.raiseF(L, "attempt to modify a read-only %s", name_z);
             if (api.typeOf(L, 2) != .string) return api.raiseF(L, "%s fields are indexed by name, got %s", name_z, api.typeName(L, 2));
-            const key = api.toLString(L, 2).?;
+            const key = api.toLString(L, 2) orelse return api.raiseF(L, "%s fields are indexed by name", name_z);
             const self: *T = @ptrCast(@alignCast(header.ptr));
             const info = @typeInfo(T).@"struct";
             inline for (info.field_names, info.field_types, info.field_attrs) |name, FT, attrs| {
@@ -479,9 +545,10 @@ fn newIndexFn(comptime T: type) api.CFunction {
                         const value = convert.to(FT, L, 3) catch {
                             return api.raiseF(L, "bad value for field '%s' of %s (%s expected, got %s)", name.ptr, name_z, convert.typeName(FT).ptr, api.typeName(L, 3));
                         };
-                        // A Lua-owned object owns the handles in its fields.
-                        if (comptime convert.isHandleLike(FT)) {
-                            if (header.owned) convert.releaseHandle(@field(self.*, name));
+                        // A Lua-owned object owns the handles in its fields,
+                        // wherever they sit, so the old ones go.
+                        if (comptime convert.hasHandles(FT)) {
+                            if (header.owned) convert.releaseHandles(@field(self.*, name));
                         }
                         @field(self.*, name) = value;
                         return 0;
@@ -537,10 +604,10 @@ fn finalize(comptime T: type, header: *Header, deferred: bool) void {
 fn releaseHandleFields(comptime T: type, self: *T, deferred: bool) void {
     const info = @typeInfo(T).@"struct";
     inline for (info.field_names, info.field_types, info.field_attrs) |name, FT, attrs| {
-        if (comptime !attrs.@"comptime" and convert.isHandleLike(FT)) {
-            if (convert.handleRef(@field(self.*, name))) |r| {
-                if (deferred) r.state.deferUnref(r.id) else r.deinit();
-            }
+        // Handles anywhere inside a field, not only a field that is one.
+        if (comptime !attrs.@"comptime" and convert.hasHandles(FT)) {
+            const value = @field(self.*, name);
+            if (deferred) convert.deferHandles(value) else convert.releaseHandles(value);
         }
     }
 }
@@ -550,7 +617,7 @@ fn toStringFn(comptime T: type) api.CFunction {
         fn toString(L_: ?*lua_State) callconv(.c) c_int {
             const L = L_.?;
             const header = headerOf(L, T, 1) orelse return api.raiseF(L, "%s expected", displayName(T).ptr);
-            if (header.dead) {
+            if (isHeaderDead(header)) {
                 _ = api.pushFString(L, "%s (no longer exists)", displayName(T).ptr);
             } else {
                 _ = api.pushFString(L, "%s: %p", displayName(T).ptr, header.ptr);

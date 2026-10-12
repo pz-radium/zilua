@@ -138,7 +138,7 @@ test "fields whose copies would share finalized resources cannot be assigned" {
     lua.setGlobal("holder", &holder);
     lua.setGlobal("other", Owner{ .id = 2 });
     lua.setGlobal("v", Vec2{ .x = 3, .y = 4 });
-    // A copy of `other` would be deinit'ed twice: refused.
+    // A copy of `other` would be deinit'd twice: refused.
     try testing.expectError(error.Runtime, lua.doString("holder.owner = other"));
     try expectContains(lua.errorMessage(), "cannot be set from Lua");
     try testing.expectEqual(1, holder.owner.id);
@@ -220,4 +220,90 @@ test "metatables are locked and finalized values are unusable" {
     try run(lua, "r = nil");
     lua.collectGarbage();
     try testing.expectEqual(1, Resource.finalized);
+}
+
+test "a reference a method returns stays tied to the value it points into" {
+    const Chain = struct {
+        var finalized: u32 = 0;
+        x: f64,
+
+        pub const zilua_name = "Chain";
+
+        pub fn init(x: f64) @This() {
+            return .{ .x = x };
+        }
+
+        /// The chaining setter: returns a pointer into its own userdata.
+        pub fn scaled(self: *@This(), k: f64) *@This() {
+            self.x *= k;
+            return self;
+        }
+
+        pub fn deinit(self: *@This()) void {
+            _ = self;
+            finalized += 1;
+        }
+    };
+    const lua = try open();
+    defer lua.deinit();
+
+    lua.registerType(Chain);
+    // Lua drops the value `ref` points into right away.
+    try run(lua, "ref = Chain.init(2):scaled(3)");
+    lua.collectGarbage();
+    lua.collectGarbage();
+    // The reference keeps it alive, so it is neither finalized nor freed.
+    try testing.expectEqual(0, Chain.finalized);
+    try run(lua, "assert(ref.x == 6)");
+}
+
+test "reading a field whose copy would need a second owner is refused" {
+    const Item = struct {
+        var finalized: u32 = 0;
+        id: i64,
+
+        pub fn deinit(self: *@This()) void {
+            _ = self;
+            finalized += 1;
+        }
+    };
+    const Bag = struct {
+        slot: ?Item,
+        pair: [2]Item,
+        plain: ?Vec2,
+    };
+    const lua = try open();
+    defer lua.deinit();
+
+    var bag: Bag = .{ .slot = .{ .id = 1 }, .pair = .{ .{ .id = 2 }, .{ .id = 3 } }, .plain = .init(1, 2) };
+    lua.setGlobal("bag", &bag);
+    try testing.expectError(error.Runtime, lua.doString("return bag.slot"));
+    try expectContains(lua.errorMessage(), "cannot read Bag.slot from Lua");
+    try testing.expectError(error.Runtime, lua.doString("return bag.pair"));
+    // Fields that copy cleanly still do.
+    try run(lua, "assert(bag.plain.x == 1)");
+    lua.collectGarbage();
+    lua.collectGarbage();
+    try testing.expectEqual(0, Item.finalized);
+}
+
+test "a value with a finalizer cannot be built from a table" {
+    const Handle = struct {
+        fd: i64,
+
+        pub fn deinit(self: *@This()) void {
+            _ = self;
+        }
+
+        pub fn number(self: @This()) i64 {
+            return self.fd;
+        }
+    };
+    const lua = try open();
+    defer lua.deinit();
+
+    lua.registerType(Handle);
+    // A plain table is not a Handle, however much it looks like one.
+    try testing.expectError(error.Runtime, lua.doString("return Handle.number({ fd = 7 })"));
+    try expectContains(lua.errorMessage(), "Handle expected");
 }

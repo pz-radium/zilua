@@ -196,3 +196,72 @@ const Scaler = struct {
         return .{ .func = f, .args = .{x * self.factor} };
     }
 };
+
+test "handles inside parameters are released with the call" {
+    const Listener = struct { cb: zilua.Function, prio: i32 };
+    const funcs2 = struct {
+        fn take(l: Listener) i32 {
+            return l.prio;
+        }
+        fn takeMany(list: [2]zilua.Function) usize {
+            return list.len;
+        }
+    };
+    const lua = try open();
+    defer lua.deinit();
+    lua.setGlobal("take", funcs2.take);
+    lua.setGlobal("takeMany", funcs2.takeMany);
+
+    const before = helpers.registryValues(lua, .function);
+    try run(lua,
+        \\for _ = 1, 50 do
+        \\  take({ cb = function() end, prio = 1 })
+        \\  takeMany({ function() end, function() end })
+        \\end
+    );
+    lua.collectGarbage();
+    // The references the conversions took are gone, so the closures are too.
+    try testing.expectEqual(before, helpers.registryValues(lua, .function));
+}
+
+const Vec = struct { x: f64 };
+
+test "optional pointer parameters and results" {
+    const Maybe = struct {
+        var finalized: u32 = 0;
+        hp: i64,
+
+        pub const zilua_name = "Maybe";
+
+        pub fn make(hp: i64) @This() {
+            return .{ .hp = hp };
+        }
+
+        pub fn __gc(self: *@This()) void {
+            finalized += @intCast(self.hp);
+        }
+
+        /// Takes and returns optional pointers, which the result anchoring
+        /// has to cope with.
+        pub fn pick(a: ?*@This(), b: ?*const @This()) ?*@This() {
+            _ = b;
+            return a;
+        }
+    };
+    const lua = try open();
+    defer lua.deinit();
+    lua.registerType(Maybe);
+
+    try run(lua,
+        \\local m = Maybe.make(3)
+        \\assert(Maybe.pick(m, nil).hp == 3)
+        \\assert(Maybe.pick(nil, m) == nil)
+        \\kept = Maybe.pick(Maybe.make(9), nil)
+    );
+    lua.collectGarbage();
+    lua.collectGarbage();
+    // The local Maybe(3) is gone, while the Maybe(9) the result points into
+    // is kept alive by it.
+    try testing.expectEqual(3, Maybe.finalized);
+    try run(lua, "assert(kept.hp == 9)");
+}

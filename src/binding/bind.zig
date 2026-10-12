@@ -7,8 +7,9 @@
 //! - `std.Io`: the `std.Io` given to `State.setIo`
 //! - `zilua.Args` (last parameter only): the remaining Lua arguments
 //!
-//! Handle parameters (`Table`, `Function`, ...) are valid for the duration of
-//! the call and released afterwards; `clone` one to keep it.
+//! Handle parameters (`Table`, `Function`, ... also inside a struct, array
+//! or union) are valid for the duration of the call and released afterwards;
+//! `clone` one to keep it.
 //!
 //! The result is pushed with `convert.pushMulti`, so a tuple return becomes
 //! multiple Lua results and `void` becomes none. `zilua.yield(...)` yields
@@ -25,6 +26,7 @@ const convert = @import("convert.zig");
 const State = @import("../core/State.zig");
 const ref = @import("../core/ref.zig");
 const thread = @import("../core/thread.zig");
+const usertype = @import("usertype.zig");
 
 const lua_State = api.lua_State;
 
@@ -46,6 +48,9 @@ pub const Args = struct {
     }
 
     /// Argument `i` (0-based) as a `T`. Missing arguments read as nil.
+    ///
+    /// A handle in the result is a new reference the caller owns: release it
+    /// with `deinit` (or `zilua.releaseHandles` for one inside a value).
     pub fn get(self: Args, comptime T: type, i: usize) convert.Error!T {
         if (i >= self.len()) {
             if (@typeInfo(T) == .optional) return null;
@@ -124,11 +129,7 @@ pub fn isWrappable(comptime F: type) bool {
         if (P.? == Args and i != info.param_types.len - 1) return false;
         if (!isInjected(P.?) and !convert.canRead(P.?)) return false;
     }
-    const R = info.return_type.?;
-    const Payload = switch (@typeInfo(R)) {
-        .error_union => |eu| eu.payload,
-        else => R,
-    };
+    const Payload = returnPayload(F);
     if (thread.isYield(Payload)) return convert.canPush(@FieldType(Payload, "values"));
     if (isCallThen(Payload)) return convert.canPush(@FieldType(Payload, "args")) and isWrappable(@TypeOf(Payload.continuation));
     if (isOwned(Payload)) return convert.canPush(@FieldType(Payload, "value"));
@@ -152,13 +153,18 @@ pub fn push(L: *lua_State, comptime f: anytype, name: ?[*:0]const u8) void {
 }
 
 fn luauContinuationOf(comptime F: type) ?api.LuauContinuation {
+    const Value = returnPayload(F);
+    if (!isCallThen(Value)) return null;
+    return api.luauContinuation(Continuation(Value.continuation).resume_);
+}
+
+/// What a function returns, with any error union unwrapped.
+fn returnPayload(comptime F: type) type {
     const R = @typeInfo(F).@"fn".return_type.?;
-    const Value = switch (@typeInfo(R)) {
+    return switch (@typeInfo(R)) {
         .error_union => |e| e.payload,
         else => R,
     };
-    if (!isCallThen(Value)) return null;
-    return api.luauContinuation(Continuation(Value.continuation).resume_);
 }
 
 fn check(comptime F: type) void {
@@ -167,6 +173,20 @@ fn check(comptime F: type) void {
     if (info.attrs.varargs) @compileError("zilua: cannot bind variadic function " ++ @typeName(F) ++ ", take zilua.Args instead");
     for (info.param_types, 0..) |P, i| {
         if (P.? == Args and i != info.param_types.len - 1) @compileError("zilua: zilua.Args must be the last parameter of " ++ @typeName(F));
+    }
+    // A Luau closure carries the one continuation it was pushed with, so a
+    // second one, set up while the first call is suspended, is not run:
+    // Luau would call the first again with the second call's results.
+    if (api.lang == .luau) {
+        const Value = returnPayload(F);
+        if (isCallThen(Value)) {
+            const Next = returnPayload(@TypeOf(Value.continuation));
+            if (isCallThen(Next) or thread.isYield(Next)) {
+                @compileError("zilua: on Luau what follows a callThen cannot yield or use callThen again (" ++
+                    @typeName(F) ++ "): Luau has one continuation per function, which it would run a second time " ++
+                    "with the wrong results. Do the rest without yielding, or start from a new call.");
+            }
+        }
     }
 }
 
@@ -187,6 +207,17 @@ fn Trampoline(comptime f: anytype) type {
     };
 
     return struct {
+        /// Whether a failed push would strand references this call took for
+        /// its parameters. Without those (and without an `Owned` result)
+        /// there is nothing to clean up, and a failed push is simply the Lua
+        /// error it raises.
+        const guard_push = blk: {
+            for (info.param_types) |P| {
+                if (!isInjected(P.?) and convert.hasHandles(P.?)) break :blk true;
+            }
+            break :blk false;
+        };
+
         fn call(L_: ?*lua_State) callconv(.c) c_int {
             const L = L_.?;
             var diag: Diagnostic = .{};
@@ -202,6 +233,9 @@ fn Trampoline(comptime f: anytype) type {
         fn invoke(L: *lua_State, first: c_int, diag: *Diagnostic) !c_int {
             var params: Params = undefined;
             var read: usize = 0;
+            // Where each parameter read from the stack sits, so that a
+            // pointer result pointing into one can be anchored to it.
+            var slots: [info.param_types.len]c_int = @splat(0);
             comptime var offset: c_int = 0;
             inline for (info.param_types, 0..) |P, i| {
                 const T = P.?;
@@ -225,6 +259,9 @@ fn Trampoline(comptime f: anytype) type {
                         diag.* = .{ .arg = idx, .expected = convert.typeName(T) };
                         return err;
                     };
+                    // Already absolute (arguments start at `first`), and 0
+                    // for an argument the caller left out.
+                    slots[i] = if (idx <= api.getTop(L)) idx else 0;
                     offset += 1;
                 }
                 read = i + 1;
@@ -238,33 +275,48 @@ fn Trampoline(comptime f: anytype) type {
             const Value = @TypeOf(value);
 
             if (comptime thread.isYield(Value)) {
-                if (!api.checkStack(L, comptime convert.resultCount(@TypeOf(value.values)) + 2)) return error.StackOverflow;
-                const n = convert.pushMulti(L, value.values);
+                const n = pushResult(L, guard_push, @TypeOf(value.values), &value.values) catch |err| {
+                    releaseParams(params, read);
+                    return err;
+                };
                 releaseParams(params, read);
                 // On 5.2+ this longjmps out right away; nothing here has a defer.
                 return api.yieldValues(L, n);
             }
             if (comptime isCallThen(Value)) {
-                if (!api.checkStack(L, comptime convert.resultCount(@TypeOf(value.args)) + 3)) return error.StackOverflow;
+                if (!api.checkStack(L, comptime convert.resultCount(@TypeOf(value.args)) + 5)) {
+                    releaseParams(params, read);
+                    return error.StackOverflow;
+                }
                 const base = api.getTop(L);
                 value.func.push(L);
-                const nargs = convert.pushMulti(L, value.args);
+                const nargs = pushResult(L, guard_push, @TypeOf(value.args), &value.args) catch |err| {
+                    api.setTop(L, base);
+                    releaseParams(params, read);
+                    return err;
+                };
                 releaseParams(params, read);
                 return api.callWithContinuation(L, nargs, base, Continuation(Value.continuation).resume_);
             }
             if (comptime isOwned(Value)) {
-                if (!api.checkStack(L, comptime convert.resultCount(@TypeOf(value.value)) + 2)) {
+                // Always protected: a memory error must not longjmp past the
+                // free below and leak what the function allocated.
+                const n = pushResult(L, true, @TypeOf(value.value), &value.value) catch |err| {
                     convert.free(value.gpa, value.value);
-                    return error.StackOverflow;
-                }
-                const n = convert.pushMulti(L, value.value);
+                    releaseParams(params, read);
+                    return err;
+                };
                 convert.free(value.gpa, value.value);
                 releaseParams(params, read);
                 return n;
             }
-            // Lua guarantees LUA_MINSTACK (20) free slots on entry, not more.
-            if (!api.checkStack(L, comptime convert.resultCount(Value) + 2)) return error.StackOverflow;
-            const n = convert.pushMulti(L, value);
+            const n = pushResult(L, guard_push, Value, &value) catch |err| {
+                releaseParams(params, read);
+                return err;
+            };
+            // A `*T` result that points into one of the arguments must not
+            // outlive the value Lua holds there.
+            anchorResults(L, params, slots, value, api.getTop(L) - n + 1);
             // After pushing: the result may be one of the handles.
             releaseParams(params, read);
             return n;
@@ -272,12 +324,84 @@ fn Trampoline(comptime f: anytype) type {
 
         fn releaseParams(params: Params, read: usize) void {
             inline for (info.param_types, 0..) |P, i| {
-                if (comptime convert.isHandleLike(P.?)) {
-                    if (i < read) convert.releaseHandle(params[i]);
+                // Handles read from Lua belong to the parameter, wherever
+                // inside it they sit (see `convert.to`).
+                if (comptime !isInjected(P.?) and convert.hasHandles(P.?)) {
+                    if (i < read) convert.releaseHandles(params[i]);
+                }
+            }
+        }
+
+        fn anchorResults(L: *lua_State, params: Params, slots: [info.param_types.len]c_int, value: anytype, base: c_int) void {
+            switch (@typeInfo(@TypeOf(value))) {
+                .@"struct" => |s| if (s.is_tuple) {
+                    inline for (s.field_names, 0..) |name, i| {
+                        anchorResult(L, params, slots, @field(value, name), base + @as(c_int, @intCast(i)));
+                    }
+                    return;
+                },
+                else => {},
+            }
+            anchorResult(L, params, slots, value, base);
+        }
+
+        fn anchorResult(L: *lua_State, params: Params, slots: [info.param_types.len]c_int, item: anytype, at: c_int) void {
+            const T = @TypeOf(item);
+            if (comptime @typeInfo(T) == .optional) {
+                if (item) |inner| anchorResult(L, params, slots, inner, at);
+                return;
+            }
+            const pointee = comptime usertypePointer(T);
+            if (pointee == null) return; // not a pointer into anything
+            const Pointee = pointee.?;
+            const addr = @intFromPtr(item);
+            inline for (info.param_types, 0..) |P, i| {
+                if (comptime usertypePointer(P.?)) |Arg| {
+                    const start = @intFromPtr(params[i]);
+                    // A pointer into the argument's own memory: its field, an
+                    // element inside it, or the argument itself.
+                    if (slots[i] != 0 and addr >= start and addr < start + @sizeOf(Arg)) {
+                        usertype.anchorIn(L, Pointee, at, Arg, slots[i]);
+                        return;
+                    }
                 }
             }
         }
     };
+}
+
+/// The usertype a `*T`, `*const T` or `?*T` points to.
+fn usertypePointer(comptime T: type) ?type {
+    const info = @typeInfo(T);
+    if (info == .optional) return usertypePointer(info.optional.child);
+    if (info != .pointer or info.pointer.size != .one) return null;
+    const Child = info.pointer.child;
+    if (!convert.isUsertype(Child) or !usertype.isValid(Child)) return null;
+    return Child;
+}
+
+/// Pushes `value.*` and returns how many Lua values it is.
+///
+/// With `guard`, in protected mode: pushing allocates, and a memory error
+/// raised here would longjmp past Zig code that still owns memory or
+/// references. `error.LuaError` then means the Lua error object is on the
+/// stack, for `fail` to raise.
+fn pushResult(L: *lua_State, comptime guard: bool, comptime T: type, value: *const T) !c_int {
+    const n = comptime convert.resultCount(T);
+    if (comptime n == 0) return 0;
+    // Lua guarantees LUA_MINSTACK (20) free slots on entry, not more.
+    if (!api.checkStack(L, n + 5)) return error.StackOverflow;
+    if (comptime !guard) return convert.pushMulti(L, value.*);
+
+    const Pusher = struct {
+        fn push(L_: *lua_State, ud: ?*anyopaque) callconv(.c) c_int {
+            const ptr: *const T = @ptrCast(@alignCast(ud.?));
+            return convert.pushMulti(L_, ptr.*);
+        }
+    };
+    const ud: *anyopaque = @ptrCast(@constCast(value));
+    if (api.callProtected(L, Pusher.push, ud, n) != .ok) return error.LuaError;
+    return n;
 }
 
 /// Runs `next` with the results of a `callThen` call, which start after the

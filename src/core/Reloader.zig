@@ -25,6 +25,10 @@ dir: std.Io.Dir,
 files: std.ArrayList(File) = .empty,
 /// Global function called after a reload, with the file path. Null: none.
 hook: ?[:0]const u8 = "on_reload",
+/// Largest file to read. A watched file that grows past this fails to
+/// reload with `error.StreamTooLong` instead of taking all the memory it
+/// asks for; the version loaded before stays.
+max_file_size: usize = 16 << 20,
 
 const File = struct {
     path: []u8,
@@ -95,7 +99,7 @@ fn load(self: *Reloader, io: std.Io, index: usize) Error!void {
     // the file changes again.
     self.files.items[index].mtime = stat.mtime.nanoseconds;
     self.files.items[index].size = stat.size;
-    const source = try self.dir.readFileAlloc(io, path, self.gpa, .unlimited);
+    const source = try self.dir.readFileAlloc(io, path, self.gpa, .limited(self.max_file_size));
     defer self.gpa.free(source);
     try self.state.doStringNamed(source, self.files.items[index].chunkname);
 }

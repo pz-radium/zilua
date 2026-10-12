@@ -60,6 +60,9 @@ pub const Context = struct {
     instruction_limit: ?u64 = null,
     /// Nesting of calls from Zig into Lua (see `enterCall`).
     depth: u32 = 0,
+    /// The coroutine a `Thread.resumeRaw` is running, so that a resume made
+    /// from inside it can tell the runtime where it comes from.
+    running: ?*api.lua_State = null,
     /// The limit was exceeded and the hook now fires on every instruction.
     limit_tripped: bool = false,
     /// The budgets of the innermost call running under limits (a sandbox
@@ -102,6 +105,8 @@ pub fn init(gpa: std.mem.Allocator, options: Options) error{OutOfMemory}!State {
 
     api.pushLightUserdata(L, ctx);
     api.rawSetP(L, api.registry_index, &context_key);
+    api.initProtected(L);
+    initMessageHandler(L);
 
     if (builtin.optimize == .debug) verifyAbi(L);
     if (options.open_libs) api.openLibs(L);
@@ -164,6 +169,8 @@ fn attachForeign(L: *api.lua_State) *Context {
 
     api.pushLightUserdata(L, ctx);
     api.rawSetP(L, api.registry_index, &context_key);
+    api.initProtected(L);
+    initMessageHandler(L);
     return ctx;
 }
 
@@ -203,6 +210,29 @@ pub fn allocator(self: State) std.mem.Allocator {
     return self.ctx.allocator;
 }
 
+/// A stretch of work zilua does for the host outside any protected call:
+/// pushing arguments, reading results, taking references. Lua turns a failed
+/// allocation into an error, which outside protected mode panics, so the
+/// memory limit a script may have filled up must not apply here. The
+/// script's own code always runs with the limit back in place.
+///
+/// End it with `end`, or with `defer`: the only error that can still be
+/// raised in between is a real out-of-memory, which ends the process anyway.
+pub const HostWork = struct {
+    ctx: *Context,
+    memory_limit: ?usize,
+
+    pub fn end(self: HostWork) void {
+        self.ctx.memory_limit = self.memory_limit;
+    }
+};
+
+pub fn beginHostWork(self: State) HostWork {
+    const work: HostWork = .{ .ctx = self.ctx, .memory_limit = self.ctx.memory_limit };
+    self.ctx.memory_limit = null;
+    return work;
+}
+
 pub fn openLibs(self: State) void {
     api.openLibs(self.L);
 }
@@ -233,6 +263,8 @@ pub fn doFile(self: State, path: [:0]const u8) Error!void {
 pub fn loadString(self: State, source: []const u8, chunkname: [:0]const u8) Error!ref.Function {
     const status = api.loadBuffer(self.L, source, chunkname.ptr, .text);
     if (status != .ok) return self.captureError(status);
+    const work = self.beginHostWork();
+    defer work.end();
     defer api.pop(self.L, 1);
     return ref.Function.fromStack(self, -1);
 }
@@ -241,11 +273,33 @@ pub fn loadString(self: State, source: []const u8, chunkname: [:0]const u8) Erro
 /// and converts its results to `R` (`void`, one value, or a tuple for
 /// several results).
 pub fn call(self: State, comptime R: type, name: [:0]const u8, args: anytype) Error!R {
-    try self.reserveCall(@TypeOf(args), R);
-    _ = api.getGlobal(self.L, name.ptr);
-    const nargs = convert.pushMulti(self.L, args);
+    const nargs = try self.prepareCall(R, args, Global{ .name = name });
     return self.callStack(R, nargs);
 }
+
+/// Pushes the function `callee` names and then `args`, with room reserved
+/// for a call returning an `R` and the memory limit lifted: zilua's own work
+/// for the host, outside any protected call (see `beginHostWork`). Returns
+/// the number of arguments, for `callStack`.
+///
+/// `callee` is anything with a `push(L)` method: a `Global`, a `Function`
+/// handle, a `Sandbox`'s member.
+pub fn prepareCall(self: State, comptime R: type, args: anytype, callee: anytype) Error!c_int {
+    const work = self.beginHostWork();
+    defer work.end();
+    try self.reserveCall(@TypeOf(args), R);
+    callee.push(self.L);
+    return convert.pushMulti(self.L, args);
+}
+
+/// A global function, as a `prepareCall` target.
+pub const Global = struct {
+    name: [:0]const u8,
+
+    pub fn push(self: Global, L: *api.lua_State) void {
+        _ = api.getGlobal(L, self.name.ptr);
+    }
+};
 
 /// Makes sure the stack has room for a call with arguments `Args` and
 /// results `R`. Outside of C functions Lua only guarantees 20 free slots.
@@ -257,26 +311,29 @@ pub fn reserveCall(self: State, comptime Args: type, comptime R: type) Error!voi
 /// Like `call`, with results read by `toAlloc`: strings and slices are
 /// copied with `gpa`, so `R` may contain them. Free with `zilua.free`.
 pub fn callAlloc(self: State, gpa: std.mem.Allocator, comptime R: type, name: [:0]const u8, args: anytype) Error!R {
-    try self.reserveCall(@TypeOf(args), R);
-    _ = api.getGlobal(self.L, name.ptr);
-    const nargs = convert.pushMulti(self.L, args);
+    const nargs = try self.prepareCall(R, args, Global{ .name = name });
     return self.callStackAlloc(gpa, R, nargs);
 }
 
 pub fn callStackAlloc(self: State, gpa: std.mem.Allocator, comptime R: type, nargs: c_int) Error!R {
-    const base = api.getTop(self.L) - nargs - 1;
-    try self.pcallTop(nargs, comptime convert.resultCount(R));
-    defer api.setTop(self.L, base);
-    return convert.toMultiAlloc(R, gpa, self.L, base + 1);
+    return self.finishCall(gpa, R, nargs);
 }
 
 /// Calls the function pushed below `nargs` pushed arguments.
 pub fn callStack(self: State, comptime R: type, nargs: c_int) Error!R {
     comptime convert.ensureOwned(R, "call");
+    return self.finishCall(null, R, nargs);
+}
+
+/// Runs the prepared call and reads its results, which `gpa` makes owned.
+fn finishCall(self: State, gpa: ?std.mem.Allocator, comptime R: type, nargs: c_int) Error!R {
     const base = api.getTop(self.L) - nargs - 1;
     try self.pcallTop(nargs, comptime convert.resultCount(R));
     defer api.setTop(self.L, base);
-    return convert.toMulti(R, self.L, base + 1);
+    // Reading the results is zilua's own work (see `beginHostWork`).
+    const work = self.beginHostWork();
+    defer work.end();
+    return convert.readMulti(R, gpa, self.L, base + 1);
 }
 
 /// Calls the function below the top `nargs` values in protected mode. On
@@ -288,37 +345,52 @@ fn pcallTop(self: State, nargs: c_int, nresults: c_int) Error!void {
     var msgh: c_int = 0;
     if (self.ctx.traceback) {
         msgh = api.getTop(L) - nargs;
-        api.pushCFunction(L, messageHandler);
+        pushMessageHandler(L);
         api.insert(L, msgh);
     }
     const status = api.pcall(L, nargs, nresults, msgh);
     if (msgh != 0) api.remove(L, msgh);
     if (status != .ok) return self.captureError(status);
+    if (comptime api.lang == .luau) {
+        // Luau makes a call from a C function that has a continuation (a
+        // bound function returning `CallThen`) yieldable, so this one may
+        // have yielded rather than returned: there are no results to read.
+        if (api.threadStatus(L) == .yield) {
+            self.ctx.setErrorMessage("a Lua function yielded across a call from Zig");
+            return error.Runtime;
+        }
+    }
 }
 
 /// Pops the error value on top of the stack, saves it as `errorMessage()`
 /// and returns the matching error.
 fn captureError(self: State, status: api.Status) Error {
     const L = self.L;
-    // This runs outside protected mode, where an error would panic. The
-    // allocations it makes must not fail on a memory limit that the script
-    // has just run into; nothing is restored by defer, as a Lua error would
-    // skip it (only a real out-of-memory can raise here).
+    // This runs outside protected mode, where an error would panic. The one
+    // allocation it can make (turning a number into a string) must not fail
+    // on a memory limit the script has just run into; nothing is restored by
+    // defer, as a Lua error would skip it (only a real out-of-memory can
+    // raise here).
     const limit = self.ctx.memory_limit;
-    self.ctx.memory_limit = null;
-    switch (api.typeOf(L, -1)) {
-        .string, .number => self.ctx.setErrorMessage(api.toLString(L, -1).?),
-        else => {
-            // Calling __tostring here would run Lua code outside protected
-            // mode. With `traceback` on, the message handler already did it.
-            _ = api.pushFString(L, "(error object is a %s value)", api.typeName(L, -1));
-            self.ctx.setErrorMessage(api.toLString(L, -1).?);
-            api.pop(L, 1);
-        },
-    }
+    if (limit) |l| self.ctx.memory_limit = l +| error_headroom;
+    var buf: [error_message_size]u8 = undefined;
+    self.ctx.setErrorMessage(errorText(L, &buf));
     api.pop(L, 1);
     self.ctx.memory_limit = limit;
     return statusError(status);
+}
+
+/// The error object on top of `L` as text. Calling its `__tostring` would
+/// run Lua code outside protected mode, so a value that is not a string
+/// (or a number, which Lua converts) is only described. With `traceback` on
+/// the message handler has already run `__tostring` for us.
+fn errorText(L: *api.lua_State, buf: []u8) [:0]const u8 {
+    return switch (api.typeOf(L, -1)) {
+        .string, .number => std.mem.span(api.toCString(L, -1).?),
+        else => std.fmt.bufPrintSentinel(buf, "(error object is a {s} value)", .{
+            std.mem.span(api.typeName(L, -1)),
+        }, 0) catch "(error object)",
+    };
 }
 
 fn statusError(status: api.Status) Error {
@@ -336,25 +408,37 @@ fn statusError(status: api.Status) Error {
 /// value is on top of `co`, and the message gets a traceback of `co`.
 pub fn captureThreadError(self: State, co: *api.lua_State, status: api.Status) Error {
     const main = self.ctx.main;
-    // Unprotected from here on: see `captureError`.
+    // Unprotected from here on: see `captureError`. The limit is raised by a
+    // fixed amount rather than lifted: a coroutine that died of a stack
+    // overflow has thousands of frames to report, and Luau's traceback shows
+    // them all, so building it must not be able to use up all memory.
     const limit = self.ctx.memory_limit;
-    self.ctx.memory_limit = null;
-    const msg: [*:0]const u8 = switch (api.typeOf(co, -1)) {
-        .string, .number => api.toCString(co, -1).?,
-        else => api.pushFString(co, "(error object is a %s value)", api.typeName(co, -1)),
-    };
-    if (self.ctx.traceback) {
-        api.traceback(main, co, msg, 0);
+    if (limit) |l| self.ctx.memory_limit = l +| error_headroom;
+    var buf: [error_message_size]u8 = undefined;
+    const message = errorText(co, &buf);
+    // The traceback allocates, so it runs protected: without it the plain
+    // message is still reported.
+    if (self.ctx.traceback and api.tracebackProtected(main, co, message.ptr, 0)) {
+        self.ctx.setErrorMessage(api.toLString(main, -1).?);
+        api.pop(main, 1);
     } else {
-        api.pushString(main, std.mem.span(msg));
+        self.ctx.setErrorMessage(message);
     }
-    self.ctx.setErrorMessage(api.toLString(main, -1).?);
-    api.pop(main, 1);
-    // The coroutine is dead; drop what is left on its stack.
-    api.setTop(co, 0);
+    // The coroutine is dead; drop what is left on its stack. `Thread`
+    // refuses to resume one that is executing, so this is for a host driving
+    // coroutines itself: clearing a live frame's stack would unroot the
+    // values it is working with.
+    if (!api.isRunning(co)) api.setTop(co, 0);
     self.ctx.memory_limit = limit;
     return statusError(status);
 }
+
+/// How much memory building an error message may use on top of a limit the
+/// script has run into.
+const error_headroom = 1 << 20;
+
+/// Room for describing an error object zilua cannot turn into text itself.
+const error_message_size = 128;
 
 /// Bookkeeping for calls from Zig into Lua. The instruction limit counts
 /// from the start of the outermost one.
@@ -369,10 +453,24 @@ pub fn enterCall(self: State) void {
         }
         if (self.ctx.limit_tripped) {
             self.ctx.limit_tripped = false;
-            api.setStepHook(self.ctx.main, &stepHook);
+            self.setStepHooks(true);
         }
     }
     self.ctx.depth += 1;
+}
+
+/// Installs or removes the step hook on the threads zilua runs code on: the
+/// main one, and this handle's own if it is a coroutine. PUC Lua hooks
+/// belong to each thread, so a coroutine running a call from Zig (a bound
+/// function that took a `State`, a `Scheduler` task) needs its own.
+fn setStepHooks(self: State, enabled: bool) void {
+    self.installStepHook(self.ctx.main, enabled);
+    if (self.L != self.ctx.main) self.installStepHook(self.L, enabled);
+}
+
+fn installStepHook(self: State, L: *api.lua_State, enabled: bool) void {
+    api.setStepHook(L, if (enabled) &stepHook else null);
+    if (enabled) api.setStepInterval(L, self.stepInterval());
 }
 
 pub fn leaveCall(self: State) void {
@@ -400,6 +498,8 @@ pub fn fail(self: State, message: []const u8) error{LuaError} {
 /// Sets global `name` to `value`, converted with the rules in README.md.
 /// Functions are wrapped automatically: `lua.setGlobal("add", add)`.
 pub fn setGlobal(self: State, name: [:0]const u8, value: anytype) void {
+    const work = self.beginHostWork();
+    defer work.end();
     if (@typeInfo(@TypeOf(value)) == .@"fn") {
         // Named, so that Luau's error messages can mention the function.
         bind.push(self.L, value, name.ptr);
@@ -414,17 +514,21 @@ pub fn setGlobal(self: State, name: [:0]const u8, value: anytype) void {
 /// structs with string fields can be read from tables. Release the result
 /// with `zilua.free(gpa, value)`.
 pub fn getGlobalAlloc(self: State, gpa: std.mem.Allocator, comptime T: type, name: [:0]const u8) Error!T {
-    _ = api.getGlobal(self.L, name.ptr);
-    defer api.pop(self.L, 1);
-    return convert.toAlloc(T, gpa, self.L, -1);
+    return self.readGlobal(gpa, T, name);
 }
 
 /// Reads global `name` as a `T`.
 pub fn getGlobal(self: State, comptime T: type, name: [:0]const u8) Error!T {
     comptime convert.ensureOwned(T, "getGlobal");
+    return self.readGlobal(null, T, name);
+}
+
+fn readGlobal(self: State, gpa: ?std.mem.Allocator, comptime T: type, name: [:0]const u8) Error!T {
+    const work = self.beginHostWork();
+    defer work.end();
     _ = api.getGlobal(self.L, name.ptr);
     defer api.pop(self.L, 1);
-    return convert.to(T, self.L, -1);
+    return convert.readAt(T, gpa, self.L, -1, 0);
 }
 
 /// Exposes the public functions of `T` as global table `displayName(T)`
@@ -444,6 +548,11 @@ pub fn registerType(self: State, comptime T: type) void {
 ///     ...
 ///     lua.invalidate(player);
 ///     gpa.destroy(player);
+///
+/// References handed out afterwards are new and live again, so invalidate
+/// after the last push. One exception: a reference that only a finalizer
+/// still holds (a `__gc` metamethod that captured it) may have been dropped
+/// from zilua's lookup by then, and would not be found.
 pub fn invalidate(self: State, ptr: anytype) void {
     const P = @typeInfo(@TypeOf(ptr));
     if (comptime P != .pointer or P.pointer.size != .one or !convert.isUsertype(P.pointer.child)) {
@@ -502,6 +611,8 @@ pub fn memoryUsed(self: State) usize {
 
 /// A new coroutine that will run `func` when first run. See `Thread`.
 pub fn newThread(self: State, func: ref.Function) thread.Thread {
+    const work = self.beginHostWork();
+    defer work.end();
     const co = api.newThread(self.L);
     const t = thread.Thread.fromStack(self, -1);
     api.pop(self.L, 1);
@@ -515,6 +626,11 @@ pub fn newThread(self: State, func: ref.Function) thread.Thread {
 /// Makes allocations fail once Lua would hold more than `limit` bytes (null:
 /// no limit). Lua turns them into "not enough memory" errors, which scripts
 /// can catch with pcall and zilua calls return as `error.OutOfMemory`.
+///
+/// The limit covers what Lua allocates for scripts, not what zilua allocates
+/// to call them: pushing arguments and reading results happen with the limit
+/// lifted (see `beginHostWork`), since Lua would turn a failure there into an
+/// error raised outside any protected call.
 pub fn setMemoryLimit(self: State, limit: ?usize) void {
     if (self.ctx.foreign) @panic("zilua: memory limits need a state created by State.init");
     self.ctx.memory_limit = limit;
@@ -526,6 +642,10 @@ pub fn setMemoryLimit(self: State, limit: ?usize) void {
 /// Scripts cannot catch their way past it: the error repeats until control
 /// returns to Zig.
 ///
+/// The limit is a debug hook, so code that can reach `debug.sethook` can
+/// remove it. Scripts that are not trusted belong in a `Sandbox`, whose
+/// environment has no debug library.
+///
 /// Precision differs by runtime: PUC Lua and LuaJIT count in steps of 1000
 /// instructions, Luau counts safepoints (loop iterations, calls, returns).
 /// LuaJIT's JIT compiler is off while a limit is set, since compiled code
@@ -535,7 +655,7 @@ pub fn setInstructionLimit(self: State, limit: ?u64) void {
     self.ctx.instruction_limit = limit;
     self.ctx.instructions = 0;
     self.ctx.limit_tripped = false;
-    api.setStepHook(self.ctx.main, if (limit != null) &stepHook else null);
+    self.setStepHooks(limit != null);
 }
 
 fn stepHook(L: *api.lua_State) void {
@@ -545,11 +665,11 @@ fn stepHook(L: *api.lua_State) void {
     if (ctx.instructions <= limit) return;
     // From now on raise at every instruction, so that a pcall that catches
     // the error cannot keep a loop going: the next instruction after it
-    // raises again, all the way out to Zig.
-    if (!ctx.limit_tripped) {
-        ctx.limit_tripped = true;
-        api.setStepInterval(L, 1);
-    }
+    // raises again, all the way out to Zig. PUC Lua hooks belong to each
+    // thread, so this has to be set on every thread that runs over the
+    // limit, not only on the first one to reach it.
+    ctx.limit_tripped = true;
+    api.setStepInterval(L, 1);
     // Raised from a hook with no Zig defer pending.
     _ = api.raiseF(L, "instruction limit exceeded");
 }
@@ -585,7 +705,14 @@ pub fn activeLimits(self: State) ?Sandbox.Limits {
 /// Coroutines only copy their creator's hook when created, so one made
 /// before the limit was set would otherwise run unchecked.
 pub fn hookThread(self: State, co: *api.lua_State) void {
-    if (self.ctx.instruction_limit != null) api.hookThread(co);
+    if (self.ctx.instruction_limit == null) return;
+    api.hookThread(co, self.stepInterval());
+}
+
+/// How often the step hook should fire: at every instruction once a limit
+/// has been exceeded, so that catching the error cannot buy more time.
+fn stepInterval(self: State) c_int {
+    return if (self.ctx.limit_tripped) 1 else @intCast(api.step_instructions);
 }
 
 /// Tightens the limits for one call (see `Sandbox`): at most `memory_budget`
@@ -610,7 +737,7 @@ pub fn applyLimits(self: State, memory_budget: ?usize, instruction_budget: ?u64)
         // The count starts over with the outermost call from Zig.
         const start = if (ctx.depth == 0) 0 else ctx.instructions;
         ctx.instruction_limit = tighter(u64, ctx.instruction_limit, start +| budget);
-        if (saved.instructions == null) api.setStepHook(ctx.main, &stepHook);
+        self.setStepHooks(true);
     }
     return saved;
 }
@@ -621,10 +748,12 @@ pub fn restoreLimits(self: State, saved: SavedLimits) void {
     ctx.active_limits = saved.active;
     if (saved.set_instructions) {
         ctx.instruction_limit = saved.instructions;
-        if (saved.instructions == null) {
-            api.setStepHook(ctx.main, null);
-            ctx.limit_tripped = false;
-        }
+        ctx.limit_tripped = false;
+        // Re-armed even when the outer limit stays: the inner one may have
+        // been exceeded, which leaves the hook firing at every instruction,
+        // and the outer one gets its own pace back (and trips again if it is
+        // exceeded too).
+        self.setStepHooks(saved.instructions != null);
     }
 }
 
@@ -721,6 +850,24 @@ fn reallocate(gpa: std.mem.Allocator, ptr: ?*anyopaque, old_size: usize, nsize: 
 fn panicHandler(L_: ?*api.lua_State) callconv(.c) c_int {
     const msg = api.toLString(L_.?, -1) orelse "(error object is not a string)";
     std.debug.panic("zilua: unprotected Lua error: {s}", .{msg});
+}
+
+/// Its address is the registry key of the cached message handler.
+var message_handler_key: u8 = 0;
+
+/// Creates the closure `pushMessageHandler` hands out. On 5.1, LuaJIT and
+/// Luau a C closure is allocated, which must not happen just before a
+/// protected call: a script that has filled the memory limit would make it
+/// raise with nothing to catch the error.
+fn initMessageHandler(L: *api.lua_State) void {
+    api.pushCFunction(L, messageHandler);
+    api.rawSetP(L, api.registry_index, &message_handler_key);
+}
+
+fn pushMessageHandler(L: *api.lua_State) void {
+    if (api.rawGetP(L, api.registry_index, &message_handler_key) == .function) return;
+    api.pop(L, 1);
+    api.pushCFunction(L, messageHandler);
 }
 
 /// Message handler for protected calls: turns the error into a string and
