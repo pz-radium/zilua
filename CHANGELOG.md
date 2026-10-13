@@ -33,6 +33,12 @@ past a sandbox's instruction limit.
   let a script choose what gets released (a file descriptor, a texture id),
   and could be read as an owned result (`getGlobal`, `call`), whose copy
   shared what the original releases. Both are refused.
+- On LuaJIT, a script that ran into a memory limit while its code was
+  JIT-compiled ended the process instead of raising: LuaJIT unwinds errors
+  through the system unwinder, for which it registers the unwind info of
+  every trace with `__register_frame`, and where that lookup fails the error
+  reaches no protected call. The compiler is off while a limit is set, as it
+  already was for an instruction limit.
 - Resuming a coroutine that was running, or that had resumed another, was
   reported by clearing the stack of its live frame (5.1 and LuaJIT do that
   in `lua_resume` itself), unrooting the values it was working with.

@@ -65,6 +65,8 @@ pub const Context = struct {
     running: ?*api.lua_State = null,
     /// The limit was exceeded and the hook now fires on every instruction.
     limit_tripped: bool = false,
+    /// LuaJIT's compiler has been turned off for a limit (see `updateJit`).
+    jit_off: bool = false,
     /// The budgets of the innermost call running under limits (a sandbox
     /// call, a limited `Scheduler` task), which the tasks it spawns inherit.
     active_limits: ?Sandbox.Limits = null,
@@ -631,9 +633,25 @@ pub fn newThread(self: State, func: ref.Function) thread.Thread {
 /// to call them: pushing arguments and reading results happen with the limit
 /// lifted (see `beginHostWork`), since Lua would turn a failure there into an
 /// error raised outside any protected call.
+///
+/// On LuaJIT this turns the JIT compiler off (see `api.setJit`): an
+/// allocation that fails inside compiled code cannot be reported on every
+/// platform.
 pub fn setMemoryLimit(self: State, limit: ?usize) void {
     if (self.ctx.foreign) @panic("zilua: memory limits need a state created by State.init");
     self.ctx.memory_limit = limit;
+    self.updateJit();
+}
+
+/// Keeps LuaJIT's compiler off while either limit is set (see `api.setJit`).
+/// Only the limits the host configures count, not the moments zilua lifts
+/// the memory limit for its own work, which must not flush every trace.
+fn updateJit(self: State) void {
+    if (comptime api.lang != .luajit) return;
+    const off = self.ctx.instruction_limit != null or self.ctx.memory_limit != null;
+    if (off == self.ctx.jit_off) return;
+    self.ctx.jit_off = off;
+    api.setJit(self.ctx.main, !off);
 }
 
 /// Stops Lua code that runs more than about `limit` VM instructions within
@@ -649,13 +667,14 @@ pub fn setMemoryLimit(self: State, limit: ?usize) void {
 /// Precision differs by runtime: PUC Lua and LuaJIT count in steps of 1000
 /// instructions, Luau counts safepoints (loop iterations, calls, returns).
 /// LuaJIT's JIT compiler is off while a limit is set, since compiled code
-/// does not run hooks. Set the limit before creating coroutines.
+/// runs no hooks.
 pub fn setInstructionLimit(self: State, limit: ?u64) void {
     if (self.ctx.foreign) @panic("zilua: instruction limits need a state created by State.init");
     self.ctx.instruction_limit = limit;
     self.ctx.instructions = 0;
     self.ctx.limit_tripped = false;
     self.setStepHooks(limit != null);
+    self.updateJit();
 }
 
 fn stepHook(L: *api.lua_State) void {
@@ -739,6 +758,7 @@ pub fn applyLimits(self: State, memory_budget: ?usize, instruction_budget: ?u64)
         ctx.instruction_limit = tighter(u64, ctx.instruction_limit, start +| budget);
         self.setStepHooks(true);
     }
+    self.updateJit();
     return saved;
 }
 
@@ -755,6 +775,7 @@ pub fn restoreLimits(self: State, saved: SavedLimits) void {
         // exceeded too).
         self.setStepHooks(saved.instructions != null);
     }
+    self.updateJit();
 }
 
 fn tighter(comptime T: type, current: ?T, new: T) T {

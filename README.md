@@ -102,7 +102,11 @@ still differ:
   usertype name. Source is compiled with `luau_compile` before loading.
 - LuaJIT is built with the JIT compiler and FFI. Its errors unwind with the
   system unwinder, which needs unwind tables (Zig emits them by default on
-  the targets that need them).
+  the targets that need them). The compiler is off while a memory or
+  instruction limit is set: compiled code runs no debug hook, and an
+  allocation that fails inside it cannot be reported everywhere, since
+  LuaJIT registers the unwind info of each trace with `__register_frame`,
+  which libgcc and LLVM's libunwind disagree about.
 - Lua 5.1, 5.2, LuaJIT and Luau have no integer subtype: integers above 2^53
   lose precision, and argument errors say "number expected".
 
@@ -343,8 +347,8 @@ try sandbox.call(void, "on_event", .{event});
   the sandbox's limits.
 - Over the memory limit, allocations fail with "not enough memory". Over the
   instruction limit, every following instruction raises, so `pcall` cannot
-  keep a runaway loop alive. LuaJIT's JIT compiler is off while an
-  instruction limit is set.
+  keep a runaway loop alive. LuaJIT's JIT compiler is off while either limit
+  is set, and setting one per call flushes what it has compiled.
 - The instruction limit counts Lua instructions, not the time spent inside a
   single library call such as pattern matching on a long string: it bounds
   what a script does, not wall-clock time. For a hard time limit, run

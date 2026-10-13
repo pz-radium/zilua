@@ -1261,20 +1261,33 @@ pub fn setStepHook(L: *lua_State, f: ?StepFn) void {
     switch (lang) {
         .luau => luau.lua_callbacks(L).interrupt = if (f != null) &luauInterrupt else null,
         else => {
-            if (lang == .luajit) {
-                if (f != null) {
-                    _ = c.luaJIT_setmode(L, 0, c.LUAJIT_MODE_ENGINE | c.LUAJIT_MODE_FLUSH);
-                    _ = c.luaJIT_setmode(L, 0, c.LUAJIT_MODE_ENGINE | c.LUAJIT_MODE_OFF);
-                } else {
-                    _ = c.luaJIT_setmode(L, 0, c.LUAJIT_MODE_ENGINE | c.LUAJIT_MODE_ON);
-                }
-            }
             if (f != null) {
                 c.lua_sethook(L, &countHook, c.LUA_MASKCOUNT, @intCast(step_instructions));
             } else {
                 c.lua_sethook(L, null, 0, 0);
             }
         },
+    }
+}
+
+/// LuaJIT only: turns its compiler on or off, flushing the code it has
+/// compiled. Nothing to do on the other runtimes, which have no compiler.
+///
+/// zilua turns it off while a limit is set (see `State.setMemoryLimit` and
+/// `State.setInstructionLimit`): compiled code runs no debug hook, so the
+/// instruction limit would not see it, and an allocation that fails inside
+/// it cannot be reported on every platform. LuaJIT unwinds errors through
+/// the system unwinder there, for which it registers the unwind info of
+/// each trace with `__register_frame` -- which libgcc and LLVM's libunwind
+/// disagree about. Where that lookup fails, the error reaches no protected
+/// call and LuaJIT panics instead.
+pub fn setJit(L: *lua_State, enabled: bool) void {
+    if (comptime lang != .luajit) return;
+    if (enabled) {
+        _ = c.luaJIT_setmode(L, 0, c.LUAJIT_MODE_ENGINE | c.LUAJIT_MODE_ON);
+    } else {
+        _ = c.luaJIT_setmode(L, 0, c.LUAJIT_MODE_ENGINE | c.LUAJIT_MODE_FLUSH);
+        _ = c.luaJIT_setmode(L, 0, c.LUAJIT_MODE_ENGINE | c.LUAJIT_MODE_OFF);
     }
 }
 

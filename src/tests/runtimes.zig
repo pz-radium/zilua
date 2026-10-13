@@ -44,6 +44,24 @@ test "LuaJIT: the JIT compiler and FFI are available" {
     );
 }
 
+test "LuaJIT: a limit turns the JIT compiler off" {
+    if (zilua.lang != .luajit) return error.SkipZigTest;
+    const lua = try open();
+    defer lua.deinit();
+
+    // Compiled code runs no debug hook, and an allocation that fails inside
+    // it cannot be reported on every platform, so either limit turns the
+    // compiler off until both are gone again.
+    try run(lua, "assert(jit.status() == true)");
+    lua.setMemoryLimit(1 << 20);
+    try run(lua, "assert(jit.status() == false)");
+    lua.setInstructionLimit(1_000_000);
+    lua.setMemoryLimit(null);
+    try run(lua, "assert(jit.status() == false)");
+    lua.setInstructionLimit(null);
+    try run(lua, "assert(jit.status() == true)");
+}
+
 test "Luau: typeof reports the usertype name" {
     if (zilua.lang != .luau) return error.SkipZigTest;
     const lua = try open();
